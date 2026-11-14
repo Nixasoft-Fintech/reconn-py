@@ -6,10 +6,11 @@ import re
 import tempfile
 import uuid
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from sqlalchemy.orm import Session
 
 from app.adapters.base import AdapterError
 from app.adapters.bank_statement_adapter import (
@@ -27,10 +28,27 @@ from app.core.file_reader import (
     read_bank_statement_file,
 )
 from app.core.inspection import inspect_report
+from app.core.pagination import DEFAULT_LIMIT, DEFAULT_PAGE, LimitParam, PageParam
 from app.matching.engine import MatchingConfig, reconcile_transactions
 from app.services.persistence_service import (
     save_reconciliation,
     build_frontend_summary,
+)
+from app.services.reconciliation_query_service import (
+    COMPLETED_JOB_STATUS,
+    FRONTEND_STATUS_MAP,
+    count_fund_request_results,
+    count_matched_bank_transactions,
+    count_unmatched_bank_transactions,
+    count_va_transaction_results,
+    get_db_session,
+    get_reconciliation_job,
+    list_fund_request_results,
+    list_matched_bank_transactions,
+    list_unmatched_bank_transactions,
+    list_va_transaction_results,
+    serialize_result,
+    serialize_unmatched_bank,
 )
 
 APP_TITLE = "Bank Statement Reconciliation API"
@@ -368,3 +386,241 @@ async def reconcile(
                 "unmatched transactions, duplicates and exceptions."
             ),
         }
+        
+@app.get("/api/reconciliation/{job_id}/summary")
+async def get_reconciliation_summary(
+    job_id: uuid.UUID,
+) -> dict[str, Any]:
+    """
+    Retrieve the saved summary for a reconciliation job.
+    """
+
+    with SessionLocal() as session:
+
+        job = session.get(ReconciliationJob, job_id)
+
+        if job is None:
+            raise HTTPException(
+                status_code=404,
+                detail="Reconciliation job not found.",
+            )
+
+        summary_record = session.scalar(
+            select(ReconciliationSummary).where(ReconciliationSummary.job_id == job_id)
+        )
+
+        if summary_record is None:
+            raise HTTPException(
+                status_code=404,
+                detail="Summary not found for this reconciliation job.",
+            )
+
+        return {
+            "job_id": str(job.job_id),
+            "status": job.status,
+            "created_at": (job.created_at.isoformat() if job.created_at else None),
+            "completed_at": (
+                job.completed_at.isoformat() if job.completed_at else None
+            ),
+            "summary": summary_record.summary_data,
+        }
+
+
+FundRequestStatus = Literal["MATCHED", "NOT_FOUND"]
+
+
+@app.get("/api/reconciliation/{job_id}/fund-requests")
+def get_fund_request_results(
+    job_id: uuid.UUID,
+    status: FundRequestStatus = Query(...),
+    page: PageParam = DEFAULT_PAGE,
+    limit: LimitParam = DEFAULT_LIMIT,
+    session: Session = Depends(get_db_session),
+) -> dict[str, Any]:
+    """Return stored Fund Request results for a completed reconciliation job.
+
+    ``MATCHED`` maps to the engine's individually confirmed ``MATCHED`` status.
+    ``NOT_FOUND`` maps directly to the engine's ``NOT_FOUND`` status.  All other
+    engine statuses are intentionally excluded.
+
+    Results are paginated at the database level after applying the job and
+    status filters.
+    """
+
+    job = get_reconciliation_job(session, job_id)
+
+    if job is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Reconciliation job '{job_id}' was not found.",
+        )
+
+    if (job.status or "").strip().upper() != COMPLETED_JOB_STATUS:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Reconciliation job '{job_id}' is not completed "
+                f"(status: {job.status})."
+            ),
+        )
+
+    internal_status = FRONTEND_STATUS_MAP[status]
+    total = count_fund_request_results(session, job_id, internal_status)
+    offset = (page - 1) * limit
+    rows = list_fund_request_results(
+        session,
+        job_id,
+        internal_status,
+        offset=offset,
+        limit=limit,
+    )
+    total_pages = (total + limit - 1) // limit
+
+    return {
+        "job_id": str(job.job_id),
+        "status": status,
+        "total": total,
+        "page": page,
+        "limit": limit,
+        "total_pages": total_pages,
+        "has_next": page < total_pages,
+        "has_previous": page > 1,
+        "items": [serialize_result(row) for row in rows],
+    }
+
+
+VATransactionStatus = Literal["MATCHED", "NOT_FOUND"]
+
+
+@app.get("/api/reconciliation/{job_id}/va-transactions")
+def get_va_transaction_results(
+    job_id: uuid.UUID,
+    status: VATransactionStatus = Query(...),
+    page: PageParam = DEFAULT_PAGE,
+    limit: LimitParam = DEFAULT_LIMIT,
+    session: Session = Depends(get_db_session),
+) -> dict[str, Any]:
+    """Return stored VA Transaction results for a completed reconciliation job.
+
+    ``MATCHED`` maps to the engine's confirmed ``MATCHED`` status and
+    ``NOT_FOUND`` maps directly to the engine's ``NOT_FOUND`` status.  All other
+    engine statuses are intentionally excluded.
+
+    Results are paginated at the database level after applying the job, source
+    type and status filters.
+    """
+
+    job = get_reconciliation_job(session, job_id)
+
+    if job is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Reconciliation job '{job_id}' was not found.",
+        )
+
+    if (job.status or "").strip().upper() != COMPLETED_JOB_STATUS:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Reconciliation job '{job_id}' is not completed "
+                f"(status: {job.status})."
+            ),
+        )
+
+    internal_status = FRONTEND_STATUS_MAP[status]
+    total = count_va_transaction_results(session, job_id, internal_status)
+    offset = (page - 1) * limit
+    rows = list_va_transaction_results(
+        session,
+        job_id,
+        internal_status,
+        offset=offset,
+        limit=limit,
+    )
+    total_pages = (total + limit - 1) // limit
+
+    return {
+        "job_id": str(job.job_id),
+        "status": status,
+        "total": total,
+        "page": page,
+        "limit": limit,
+        "total_pages": total_pages,
+        "has_next": page < total_pages,
+        "has_previous": page > 1,
+        "items": [serialize_result(row) for row in rows],
+    }
+
+
+BankTransactionStatus = Literal["MATCHED", "NOT_FOUND"]
+
+
+@app.get("/api/reconciliation/{job_id}/bank-transactions")
+def get_bank_transaction_results(
+    job_id: uuid.UUID,
+    status: BankTransactionStatus = Query(...),
+    page: PageParam = DEFAULT_PAGE,
+    limit: LimitParam = DEFAULT_LIMIT,
+    session: Session = Depends(get_db_session),
+) -> dict[str, Any]:
+    """Return stored Bank Transaction results for a completed job.
+
+    ``MATCHED`` returns confirmed bank rows that were linked to a Fund Request
+    or VA transaction by the matching engine.  ``NOT_FOUND`` returns bank rows
+    that were persisted in the unmatched bank table, meaning no Fund Request or
+    VA transaction was allocated to them.
+
+    Job and status filters are applied before database-level pagination.
+    """
+
+    job = get_reconciliation_job(session, job_id)
+
+    if job is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Reconciliation job '{job_id}' was not found.",
+        )
+
+    if (job.status or "").strip().upper() != COMPLETED_JOB_STATUS:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Reconciliation job '{job_id}' is not completed "
+                f"(status: {job.status})."
+            ),
+        )
+
+    offset = (page - 1) * limit
+
+    if status == "MATCHED":
+        total = count_matched_bank_transactions(session, job_id)
+        rows = list_matched_bank_transactions(
+            session,
+            job_id,
+            offset=offset,
+            limit=limit,
+        )
+        items = [serialize_result(row) for row in rows]
+    else:
+        total = count_unmatched_bank_transactions(session, job_id)
+        rows = list_unmatched_bank_transactions(
+            session,
+            job_id,
+            offset=offset,
+            limit=limit,
+        )
+        items = [serialize_unmatched_bank(row) for row in rows]
+
+    total_pages = (total + limit - 1) // limit
+
+    return {
+        "job_id": str(job.job_id),
+        "status": status,
+        "total": total,
+        "page": page,
+        "limit": limit,
+        "total_pages": total_pages,
+        "has_next": page < total_pages,
+        "has_previous": page > 1,
+        "items": items,
+    }

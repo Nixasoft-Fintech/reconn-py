@@ -348,7 +348,8 @@ def save_reconciliation(
             session.flush()
 
         # Save the original engine summary without changing its structure.
-
+        overall = frontend_summary["overall"]
+        
         session.add(
             ReconciliationSummary(
                 job_id=job_id,
