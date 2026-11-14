@@ -34,6 +34,10 @@ from app.services.persistence_service import (
     save_reconciliation,
     build_frontend_summary,
 )
+from sqlalchemy import select
+from app.database.connection import SessionLocal
+from app.db_models.reconciliation_job import ReconciliationJob
+from app.db_models.reconciliation_summary import ReconciliationSummary
 from app.services.reconciliation_query_service import (
     COMPLETED_JOB_STATUS,
     FRONTEND_STATUS_MAP,
