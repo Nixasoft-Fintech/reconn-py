@@ -1,0 +1,18 @@
+# Template only. These values must be replaced with exact headers from the
+# actual bank statement after it has been inspected.
+# The API currently accepts a flat JSON object with the same field names.
+
+utr: null
+reference_number: null
+amount: null
+# Alternatively, map both debit_amount and credit_amount instead of amount.
+debit_amount: null
+credit_amount: null
+transaction_type: null
+transaction_date: null
+user: null
+beneficiary_name: null
+narration: null
+
+# Not yet enabled in the API mapping: account number and VA number can be
+# added after the actual bank statement schema is known.

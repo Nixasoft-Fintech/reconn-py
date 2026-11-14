@@ -1,0 +1,51 @@
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+env/
+
+# Environment variables
+.env
+.env.*
+!.env.example
+
+# Backend uploaded files and generated results
+/backend/uploads/*
+!/backend/uploads/.gitkeep
+
+/backend/results/*
+!/backend/results/.gitkeep
+
+# Financial and spreadsheet files
+*.xlsx
+*.xls
+*.csv
+
+# Allow sample documentation
+!/sample_data/README.md
+
+# Node.js
+node_modules/
+
+# Build files
+dist/
+build/
+
+# Logs
+*.log
+logs/
+
+# IDE and OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+/results/*
+!/results/.gitkeep
+
+/uploads/*
+!/uploads/.gitkeep
