@@ -15,6 +15,7 @@ from app.db_models import (
     UnmatchedBankTransaction,
 )
 from app.models.reconciliation import ReconciliationOutput
+import logging
 
 
 def _json_safe(value: Any) -> Any:
@@ -286,37 +287,144 @@ def _build_unmatched_bank_record(
     )
 
 
-def save_reconciliation(
-    output: ReconciliationOutput,
+def create_pending_job(
     *,
     fund_request_filename: str | None,
     va_transaction_filename: str | None,
     bank_files: list[dict[str, Any]],
 ) -> uuid.UUID:
-    """
-    Persist one complete reconciliation job atomically.
-
-    The matching engine is not called or modified here.
-    """
+    """Create a job before background persistence begins."""
 
     job_id = uuid.uuid4()
-    summary = output.summary
-    frontend_summary = build_frontend_summary(output)
 
     with SessionLocal.begin() as session:
         job = ReconciliationJob(
             job_id=job_id,
-            status="COMPLETED",
+            status="PENDING",
             fund_request_filename=fund_request_filename,
             va_transaction_filename=va_transaction_filename,
             bank_files=_json_safe(bank_files),
-            completed_at=datetime.now(timezone.utc),
         )
-
         session.add(job)
-        session.flush()
 
-        # Save results in batches to limit ORM memory overhead.
+    return job_id
+
+
+# def save_reconciliation(
+#     output: ReconciliationOutput,
+#     *,
+#     fund_request_filename: str | None,
+#     va_transaction_filename: str | None,
+#     bank_files: list[dict[str, Any]],
+# ) -> uuid.UUID:
+#     """
+#     Persist one complete reconciliation job atomically.
+
+#     The matching engine is not called or modified here.
+#     """
+
+#     job_id = uuid.uuid4()
+#     summary = output.summary
+#     frontend_summary = build_frontend_summary(output)
+
+#     with SessionLocal.begin() as session:
+#         job = ReconciliationJob(
+#             job_id=job_id,
+#             status="COMPLETED",
+#             fund_request_filename=fund_request_filename,
+#             va_transaction_filename=va_transaction_filename,
+#             bank_files=_json_safe(bank_files),
+#             completed_at=datetime.now(timezone.utc),
+#         )
+
+#         session.add(job)
+#         session.flush()
+
+#         # Save results in batches to limit ORM memory overhead.
+#         batch_size = 1000
+#         result_batch = []
+
+#         for result in output.results:
+#             result_batch.append(_build_result_record(job_id, result))
+
+#             if len(result_batch) >= batch_size:
+#                 session.add_all(result_batch)
+#                 session.flush()
+#                 result_batch.clear()
+
+#         if result_batch:
+#             session.add_all(result_batch)
+#             session.flush()
+
+#         # Save unmatched bank transactions in batches.
+#         unmatched_batch = []
+
+#         for bank in output.unmatched_bank_rows:
+#             unmatched_batch.append(_build_unmatched_bank_record(job_id, bank))
+
+#             if len(unmatched_batch) >= batch_size:
+#                 session.add_all(unmatched_batch)
+#                 session.flush()
+#                 unmatched_batch.clear()
+
+#         if unmatched_batch:
+#             session.add_all(unmatched_batch)
+#             session.flush()
+
+#         # Save the original engine summary without changing its structure.
+#         overall = frontend_summary["overall"]
+
+#         session.add(
+#             ReconciliationSummary(
+#                 job_id=job_id,
+#                 source_record_count=overall["total_source_records"],
+#                 bank_record_count=overall["total_bank_records"],
+#                 matched_count=overall["total_matched_records"],
+#                 matched_amount=Decimal(str(overall["total_matched_amount"])),
+#                 unmatched_bank_count=overall["total_unmatched_bank_records"],
+#                 unmatched_bank_amount=Decimal(
+#                     str(overall["total_unmatched_bank_amount"])
+#                 ),
+#                 status_counts=_json_safe(summary.get("status_counts", {})),
+#                 by_source=_json_safe(
+#                     {
+#                         "fund_request": frontend_summary["fund_request"],
+#                         "va_transaction": frontend_summary["va_transaction"],
+#                     }
+#                 ),
+#                 summary_data=_json_safe(frontend_summary),
+#             )
+#         )
+
+#     return job_id
+
+
+def save_reconciliation(
+    job_id: uuid.UUID,
+    output: ReconciliationOutput,
+) -> None:
+    """
+    Persist reconciliation results for an existing pending job.
+
+    The matching engine is not called or modified here.
+    """
+
+    summary = output.summary
+    frontend_summary = build_frontend_summary(output)
+
+    with SessionLocal.begin() as session:
+        job = session.get(ReconciliationJob, job_id)
+
+        if job is None:
+            raise ValueError(f"Reconciliation job {job_id} not found.")
+
+        if job.status != "PENDING":
+            raise ValueError(
+                f"Job {job_id} is not pending. Current status: {job.status}"
+            )
+
+        job.status = "SAVING"
+
         batch_size = 1000
         result_batch = []
 
@@ -332,7 +440,6 @@ def save_reconciliation(
             session.add_all(result_batch)
             session.flush()
 
-        # Save unmatched bank transactions in batches.
         unmatched_batch = []
 
         for bank in output.unmatched_bank_rows:
@@ -347,9 +454,8 @@ def save_reconciliation(
             session.add_all(unmatched_batch)
             session.flush()
 
-        # Save the original engine summary without changing its structure.
         overall = frontend_summary["overall"]
-        
+
         session.add(
             ReconciliationSummary(
                 job_id=job_id,
@@ -372,4 +478,42 @@ def save_reconciliation(
             )
         )
 
-    return job_id
+        job.status = "COMPLETED"
+        job.completed_at = datetime.now(timezone.utc)
+
+
+logger = logging.getLogger(__name__)
+
+
+def save_reconciliation_background(
+    job_id: uuid.UUID,
+    output: ReconciliationOutput,
+) -> None:
+    """Save reconciliation results and record persistence failures."""
+
+    try:
+        save_reconciliation(job_id, output)
+
+        print(
+            f"[PERF] Database persistence completed successfully. " f"Job ID: {job_id}",
+            flush=True,
+        )
+
+    except Exception as exc:
+        print(
+            f"[PERF] Database persistence FAILED. " f"Job ID: {job_id}. Error: {exc}",
+            flush=True,
+        )
+
+        try:
+            with SessionLocal.begin() as session:
+                job = session.get(ReconciliationJob, job_id)
+
+                if job is not None:
+                    job.status = "FAILED"
+
+        except Exception:
+            logger.exception(
+                "Could not update job status to FAILED. Job ID: %s",
+                job_id,
+            )
