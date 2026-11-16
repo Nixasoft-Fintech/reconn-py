@@ -9,7 +9,16 @@ import uuid
 from pathlib import Path
 from typing import Any, Literal
 
-from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, UploadFile
+from fastapi import (
+    BackgroundTasks,
+    Depends,
+    FastAPI,
+    File,
+    Form,
+    HTTPException,
+    Query,
+    UploadFile,
+)
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
@@ -40,7 +49,8 @@ from app.services.csv_export_service import (
     va_transaction_csv,
 )
 from app.services.persistence_service import (
-    save_reconciliation,
+    create_pending_job,
+    save_reconciliation_background,
     build_frontend_summary,
 )
 from sqlalchemy import select
@@ -65,6 +75,7 @@ from app.services.reconciliation_query_service import (
     serialize_result,
     serialize_unmatched_bank,
 )
+from time import perf_counter
 
 APP_TITLE = "Bank Statement Reconciliation API"
 MAX_UPLOAD_BYTES = 50 * 1024 * 1024
@@ -235,6 +246,7 @@ async def inspect_bank_statement(
 
 @app.post("/api/reconcile")
 async def reconcile(
+    background_tasks: BackgroundTasks,
     bank_statement_file: list[UploadFile] = File(...),
     fund_request_file: UploadFile = File(...),
     va_transaction_file: UploadFile = File(...),
@@ -247,6 +259,7 @@ async def reconcile(
     Automatic bank detection is used when bank_mapping is omitted.
     Manual mapping is retained for a single custom bank statement.
     """
+    api_start = perf_counter()
 
     if not bank_statement_file:
         raise HTTPException(
@@ -297,6 +310,7 @@ async def reconcile(
         folder = Path(temp_dir)
 
         try:
+            read_start = perf_counter()
             # Read source reports.
             fund_path = await _save_upload(fund_request_file, folder)
 
@@ -360,6 +374,9 @@ async def reconcile(
                     }
                 )
 
+            read_time = perf_counter() - read_start
+            print(f"[PERF] File upload + reading + normalization: {read_time:.2f}s")
+
         except (
             FileReadError,
             AdapterError,
@@ -371,6 +388,7 @@ async def reconcile(
                 detail=str(exc),
             ) from exc
 
+        reconcile_start = perf_counter()
         # Run reconciliation once using all bank transactions.
         output = reconcile_transactions(
             [
@@ -381,26 +399,51 @@ async def reconcile(
             MatchingConfig(),
         )
 
-        # Persist the complete reconciliation job.
-        job_id = save_reconciliation(
-            output,
+        reconcile_time = perf_counter() - reconcile_start
+        print(f"[PERF] Matching engine: {reconcile_time:.2f}s")
+
+        # Build frontend summary before scheduling persistence.
+        summary_start = perf_counter()
+
+        summary = build_frontend_summary(output)
+
+        summary_time = perf_counter() - summary_start
+        print(f"[PERF] Summary generation: {summary_time:.2f}s")
+
+        # Create the job before starting background persistence.
+        job_id = create_pending_job(
             fund_request_filename=_safe_filename(fund_request_file.filename),
             va_transaction_filename=_safe_filename(va_transaction_file.filename),
             bank_files=bank_files_processed,
+            output=output,
         )
-
+           # Schedule database persistence after returning the response.
+        background_tasks.add_task(
+                    save_reconciliation_background,
+                    job_id,
+                    output,
+                )
+        
+        print("[PERF] Database persistence: scheduled in background")
+        
+            # Total endpoint execution time.
+        total_time = perf_counter() - api_start
+        
+        print(f"[PERF] Total API execution: {total_time:.2f}s")
+        
         return {
-            "job_id": str(job_id),
-            "status": "COMPLETED",
-            "summary": build_frontend_summary(output),
-            "bank_files_processed": bank_files_processed,
-            "notice": (
-                "All uploaded bank statements were normalized separately "
-                "and combined for reconciliation. Automatic bank detection "
-                "was used unless manual mapping was supplied. Review "
-                "unmatched transactions, duplicates and exceptions."
-            ),
+                "job_id": str(job_id),
+                "status": "PENDING",
+                "summary": summary,
+                "bank_files_processed": bank_files_processed,
+                "notice": (
+                    "All uploaded bank statements were normalized separately "
+                    "and combined for reconciliation. Automatic bank detection "
+                    "was used unless manual mapping was supplied. Review "
+                    "unmatched transactions, duplicates and exceptions."
+                ),
         }
+        
         
 @app.get("/api/reconciliation/history")
 def get_reconciliation_history(
