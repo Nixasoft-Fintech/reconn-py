@@ -19,6 +19,7 @@ from fastapi import (
     UploadFile,
 )
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 
 from app.adapters.base import AdapterError
@@ -39,6 +40,13 @@ from app.core.file_reader import (
 from app.core.inspection import inspect_report
 from app.core.pagination import DEFAULT_LIMIT, DEFAULT_PAGE, LimitParam, PageParam
 from app.matching.engine import MatchingConfig, reconcile_transactions
+from app.services.csv_export_service import (
+    bank_matched_csv,
+    bank_unmatched_csv,
+    build_export_filename,
+    fund_request_csv,
+    va_transaction_csv,
+)
 from app.services.persistence_service import (
     create_pending_job,
     save_reconciliation_background,
@@ -671,3 +679,104 @@ def get_bank_transaction_results(
         "has_previous": page > 1,
         "items": items,
     }
+
+
+CSV_MEDIA_TYPE = "text/csv; charset=utf-8"
+
+
+def _require_completed_job(session: Session, job_id: uuid.UUID):
+    """Validate the job used by an export without changing existing routes."""
+
+    job = get_reconciliation_job(session, job_id)
+
+    if job is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Reconciliation job '{job_id}' was not found.",
+        )
+
+    if (job.status or "").strip().upper() != COMPLETED_JOB_STATUS:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Reconciliation job '{job_id}' is not completed "
+                f"(status: {job.status})."
+            ),
+        )
+
+    return job
+
+
+def _csv_download(content, filename: str) -> StreamingResponse:
+    """Return a streamed CSV attachment with the shared download headers."""
+
+    return StreamingResponse(
+        content,
+        media_type=CSV_MEDIA_TYPE,
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+        },
+    )
+
+
+@app.get("/api/reconciliation/{job_id}/fund-requests/export")
+def export_fund_request_results(
+    job_id: uuid.UUID,
+    status: FundRequestStatus = Query(...),
+    session: Session = Depends(get_db_session),
+) -> StreamingResponse:
+    """Download every persisted Fund Request result for one status."""
+
+    _require_completed_job(session, job_id)
+
+    return _csv_download(
+        fund_request_csv(
+            session.get_bind(),
+            job_id,
+            FRONTEND_STATUS_MAP[status],
+        ),
+        build_export_filename("fund_requests", status, job_id),
+    )
+
+
+@app.get("/api/reconciliation/{job_id}/va-transactions/export")
+def export_va_transaction_results(
+    job_id: uuid.UUID,
+    status: VATransactionStatus = Query(...),
+    session: Session = Depends(get_db_session),
+) -> StreamingResponse:
+    """Download every persisted VA Transaction result for one status."""
+
+    _require_completed_job(session, job_id)
+
+    return _csv_download(
+        va_transaction_csv(
+            session.get_bind(),
+            job_id,
+            FRONTEND_STATUS_MAP[status],
+        ),
+        build_export_filename("va_transactions", status, job_id),
+    )
+
+
+@app.get("/api/reconciliation/{job_id}/bank-transactions/export")
+def export_bank_transaction_results(
+    job_id: uuid.UUID,
+    status: BankTransactionStatus = Query(...),
+    session: Session = Depends(get_db_session),
+) -> StreamingResponse:
+    """Download every persisted bank transaction result for one status."""
+
+    _require_completed_job(session, job_id)
+
+    bind = session.get_bind()
+
+    if status == "MATCHED":
+        content = bank_matched_csv(bind, job_id)
+    else:
+        content = bank_unmatched_csv(bind, job_id)
+
+    return _csv_download(
+        content,
+        build_export_filename("bank_transactions", status, job_id),
+    )

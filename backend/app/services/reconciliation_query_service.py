@@ -315,6 +315,98 @@ def list_unmatched_bank_transactions(
     return list(session.scalars(statement))
 
 
+def _stream_results(session: Session, statement) -> Iterator[ReconciliationResult]:
+    """Yield ORM rows in batches without applying API pagination."""
+
+    statement = statement.execution_options(yield_per=EXPORT_BATCH_SIZE)
+    yield from session.scalars(statement)
+
+
+def iter_fund_request_results(
+    session: Session,
+    job_id: uuid.UUID,
+    internal_status: str,
+) -> Iterator[ReconciliationResult]:
+    """Stream every Fund Request result for one job and exact status.
+
+    The same filters and ordering as the paginated API are used, but no
+    ``offset``/``limit`` is applied so exports contain the complete dataset.
+    """
+
+    statement = (
+        select(ReconciliationResult)
+        .where(
+            *_source_result_filters(
+                job_id,
+                FUND_REQUEST_SOURCE_TYPE,
+                internal_status,
+            )
+        )
+        .order_by(ReconciliationResult.id.asc())
+    )
+
+    yield from _stream_results(session, statement)
+
+
+def iter_va_transaction_results(
+    session: Session,
+    job_id: uuid.UUID,
+    internal_status: str,
+) -> Iterator[ReconciliationResult]:
+    """Stream every VA Transaction result for one job and exact status."""
+
+    statement = (
+        select(ReconciliationResult)
+        .where(
+            *_source_result_filters(
+                job_id,
+                VA_TRANSACTION_SOURCE_TYPE,
+                internal_status,
+            )
+        )
+        .order_by(ReconciliationResult.id.asc())
+    )
+
+    yield from _stream_results(session, statement)
+
+
+def iter_matched_bank_transactions(
+    session: Session,
+    job_id: uuid.UUID,
+) -> Iterator[ReconciliationResult]:
+    """Stream every distinct matched bank row for one job.
+
+    The duplicate ranking is identical to the paginated API, so exports include
+    each ``(bank_source_filename, bank_row_number)`` pair once.
+    """
+
+    ranked = _matched_bank_row_ranking(job_id)
+    statement = (
+        select(ReconciliationResult)
+        .join(ranked, ReconciliationResult.id == ranked.c.result_id)
+        .where(ranked.c.bank_row_rank == 1)
+        .order_by(ReconciliationResult.id.asc())
+    )
+
+    yield from _stream_results(session, statement)
+
+
+def iter_unmatched_bank_transactions(
+    session: Session,
+    job_id: uuid.UUID,
+) -> Iterator[UnmatchedBankTransaction]:
+    """Stream every genuinely unmatched bank row for one job."""
+
+    statement = (
+        select(UnmatchedBankTransaction)
+        .where(UnmatchedBankTransaction.job_id == job_id)
+        .order_by(UnmatchedBankTransaction.id.asc())
+        .execution_options(yield_per=EXPORT_BATCH_SIZE)
+    )
+
+    yield from session.scalars(statement)
+
+
 def _text(value: Decimal | date | datetime | None) -> str | None:
     """Serialize stored scalar values using the existing API conventions."""
 
