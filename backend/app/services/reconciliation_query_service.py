@@ -9,11 +9,11 @@ from __future__ import annotations
 import uuid
 
 from collections.abc import Iterator
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from decimal import Decimal
 from typing import Any
 
-from sqlalchemy import func, select
+from sqlalchemy import case, func, select
 from sqlalchemy.orm import Session
 
 from app.database.connection import SessionLocal
@@ -313,6 +313,330 @@ def list_unmatched_bank_transactions(
         statement = statement.limit(limit)
 
     return list(session.scalars(statement))
+
+
+HISTORY_SOURCE_TYPES = (
+    FUND_REQUEST_SOURCE_TYPE,
+    VA_TRANSACTION_SOURCE_TYPE,
+)
+
+
+def _normalize_history_status_filter(status: str | None) -> str | None:
+    """Return an uppercase status filter, or ``None`` for no filtering."""
+
+    if status is None:
+        return None
+
+    normalized = status.strip().upper()
+    return normalized or None
+
+
+def _aggregate_source_status_counts(
+    session: Session,
+    job_ids: list[uuid.UUID],
+) -> dict[uuid.UUID, dict[str, dict[str, int]]]:
+    """Group Fund Request and VA result counts by job, source and status."""
+
+    if not job_ids:
+        return {}
+
+    statement = (
+        select(
+            ReconciliationResult.job_id,
+            ReconciliationResult.source_type,
+            ReconciliationResult.final_status,
+            func.count().label("record_count"),
+        )
+        .where(
+            ReconciliationResult.job_id.in_(job_ids),
+            ReconciliationResult.source_type.in_(HISTORY_SOURCE_TYPES),
+        )
+        .group_by(
+            ReconciliationResult.job_id,
+            ReconciliationResult.source_type,
+            ReconciliationResult.final_status,
+        )
+    )
+
+    counts: dict[uuid.UUID, dict[str, dict[str, int]]] = {}
+
+    for job_id, source_type, final_status, record_count in session.execute(
+        statement
+    ):
+        source_counts = counts.setdefault(job_id, {})
+        status_counts = source_counts.setdefault(source_type, {})
+        status_counts[final_status] = int(record_count)
+
+    return counts
+
+
+def _aggregate_bank_status_counts(
+    session: Session,
+    job_ids: list[uuid.UUID],
+) -> dict[uuid.UUID, dict[str, int]]:
+    """Count each persisted bank statement row once per job and status.
+
+    A bank row is identified by its source filename and statement row number,
+    matching the deduplication used by the existing bank result APIs.  When the
+    same identity is persisted more than once, a confirmed ``MATCHED`` row is
+    preferred over any other status so a bank row is never counted twice.
+    """
+
+    if not job_ids:
+        return {}
+
+    ranked = (
+        select(
+            ReconciliationResult.job_id.label("job_id"),
+            ReconciliationResult.final_status.label("final_status"),
+            func.row_number()
+            .over(
+                partition_by=(
+                    ReconciliationResult.job_id,
+                    ReconciliationResult.bank_source_filename,
+                    ReconciliationResult.bank_row_number,
+                ),
+                order_by=(
+                    case(
+                        (ReconciliationResult.final_status == "MATCHED", 0),
+                        else_=1,
+                    ),
+                    ReconciliationResult.id.asc(),
+                ),
+            )
+            .label("bank_row_rank"),
+        )
+        .where(
+            ReconciliationResult.job_id.in_(job_ids),
+            ReconciliationResult.bank_row_number.is_not(None),
+        )
+        .subquery()
+    )
+
+    statement = (
+        select(
+            ranked.c.job_id,
+            ranked.c.final_status,
+            func.count().label("record_count"),
+        )
+        .where(ranked.c.bank_row_rank == 1)
+        .group_by(ranked.c.job_id, ranked.c.final_status)
+    )
+
+    counts: dict[uuid.UUID, dict[str, int]] = {}
+
+    for job_id, final_status, record_count in session.execute(statement):
+        status_counts = counts.setdefault(job_id, {})
+        status_counts[final_status] = int(record_count)
+
+    return counts
+
+
+def _aggregate_unmatched_bank_counts(
+    session: Session,
+    job_ids: list[uuid.UUID],
+) -> dict[uuid.UUID, int]:
+    """Group genuinely unmatched bank row counts by job."""
+
+    if not job_ids:
+        return {}
+
+    statement = (
+        select(
+            UnmatchedBankTransaction.job_id,
+            func.count().label("record_count"),
+        )
+        .where(UnmatchedBankTransaction.job_id.in_(job_ids))
+        .group_by(UnmatchedBankTransaction.job_id)
+    )
+
+    return {
+        job_id: int(record_count)
+        for job_id, record_count in session.execute(statement)
+    }
+
+
+def _history_source_counts(
+    status_counts: dict[str, int],
+) -> dict[str, int]:
+    """Serialize one source category without merging other statuses."""
+
+    total = sum(int(value) for value in status_counts.values())
+    matched = int(status_counts.get("MATCHED", 0))
+    not_found = int(status_counts.get("NOT_FOUND", 0))
+
+    return {
+        "total_records": total,
+        "matched_records": matched,
+        "not_found_records": not_found,
+        "other_records": total - matched - not_found,
+    }
+
+
+def _history_bank_counts(
+    status_counts: dict[str, int],
+    unmatched_count: int,
+) -> dict[str, int]:
+    """Serialize bank counts using the existing bank result semantics."""
+
+    counts = dict(status_counts)
+    matched = int(counts.pop("MATCHED", 0))
+    other = sum(int(value) for value in counts.values())
+    not_found = int(unmatched_count)
+
+    return {
+        "total_records": matched + other + not_found,
+        "matched_records": matched,
+        "not_found_records": not_found,
+        "other_records": other,
+    }
+
+
+def _history_processing_duration(
+    job: ReconciliationJob,
+) -> float | None:
+    """Derive processing duration only when both timestamps make it possible."""
+
+    created_at = job.created_at
+    completed_at = job.completed_at
+
+    if created_at is None or completed_at is None:
+        return None
+
+    if created_at.tzinfo is None:
+        created_at = created_at.replace(tzinfo=timezone.utc)
+
+    if completed_at.tzinfo is None:
+        completed_at = completed_at.replace(tzinfo=timezone.utc)
+
+    duration = (completed_at - created_at).total_seconds()
+
+    if duration < 0:
+        return None
+
+    return round(duration, 3)
+
+
+def _serialize_history_job(
+    job: ReconciliationJob,
+    source_counts: dict[str, dict[str, int]],
+    bank_status_counts: dict[str, int],
+    unmatched_bank_count: int,
+) -> dict[str, Any]:
+    """Serialize a persisted job without running reconciliation."""
+
+    return {
+        "job_id": str(job.job_id),
+        "status": job.status,
+        "created_at": (job.created_at.isoformat() if job.created_at else None),
+        "completed_at": (
+            job.completed_at.isoformat() if job.completed_at else None
+        ),
+        "processing_duration_seconds": _history_processing_duration(job),
+        "fund_request_filename": job.fund_request_filename,
+        "va_transaction_filename": job.va_transaction_filename,
+        "bank_files": job.bank_files,
+        "fund_request": _history_source_counts(
+            source_counts.get(FUND_REQUEST_SOURCE_TYPE, {})
+        ),
+        "va_transaction": _history_source_counts(
+            source_counts.get(VA_TRANSACTION_SOURCE_TYPE, {})
+        ),
+        "bank_transaction": _history_bank_counts(
+            bank_status_counts,
+            unmatched_bank_count,
+        ),
+    }
+
+
+def _serialize_history_jobs(
+    session: Session,
+    jobs: list[ReconciliationJob],
+) -> list[dict[str, Any]]:
+    """Serialize a page of jobs using a fixed number of aggregate queries."""
+
+    if not jobs:
+        return []
+
+    job_ids = [job.job_id for job in jobs]
+    source_counts = _aggregate_source_status_counts(session, job_ids)
+    bank_counts = _aggregate_bank_status_counts(session, job_ids)
+    unmatched_counts = _aggregate_unmatched_bank_counts(session, job_ids)
+
+    return [
+        _serialize_history_job(
+            job,
+            source_counts.get(job.job_id, {}),
+            bank_counts.get(job.job_id, {}),
+            unmatched_counts.get(job.job_id, 0),
+        )
+        for job in jobs
+    ]
+
+
+def list_reconciliation_history(
+    session: Session,
+    *,
+    page: int = 1,
+    limit: int = 100,
+    status: str | None = None,
+) -> tuple[int, list[dict[str, Any]]]:
+    """Return persisted reconciliation jobs, newest first.
+
+    Pagination and optional status filtering are applied before the aggregate
+    count queries, so only jobs on the requested page are summarized.  No
+    reconciliation work is performed and no rows are written.
+    """
+
+    filters = []
+
+    normalized_status = _normalize_history_status_filter(status)
+
+    if normalized_status:
+        filters.append(
+            func.upper(ReconciliationJob.status) == normalized_status
+        )
+
+    total = int(
+        session.scalar(
+            select(func.count())
+            .select_from(ReconciliationJob)
+            .where(*filters)
+        )
+        or 0
+    )
+
+    if total == 0:
+        return 0, []
+
+    offset = (page - 1) * limit
+    statement = (
+        select(ReconciliationJob)
+        .where(*filters)
+        .order_by(
+            ReconciliationJob.created_at.desc(),
+            ReconciliationJob.job_id.desc(),
+        )
+        .offset(offset)
+        .limit(limit)
+    )
+    jobs = list(session.scalars(statement))
+
+    return total, _serialize_history_jobs(session, jobs)
+
+
+def get_reconciliation_history_job(
+    session: Session,
+    job_id: uuid.UUID,
+) -> dict[str, Any] | None:
+    """Return one persisted job for the history detail API."""
+
+    job = get_reconciliation_job(session, job_id)
+
+    if job is None:
+        return None
+
+    return _serialize_history_jobs(session, [job])[0]
 
 
 def _stream_results(session: Session, statement) -> Iterator[ReconciliationResult]:

@@ -3,6 +3,7 @@ from __future__ import annotations
 from fileinput import filename
 import json
 import re
+
 import tempfile
 import uuid
 from pathlib import Path
@@ -54,9 +55,11 @@ from app.services.reconciliation_query_service import (
     count_unmatched_bank_transactions,
     count_va_transaction_results,
     get_db_session,
+    get_reconciliation_history_job,
     get_reconciliation_job,
     list_fund_request_results,
     list_matched_bank_transactions,
+    list_reconciliation_history,
     list_unmatched_bank_transactions,
     list_va_transaction_results,
     serialize_result,
@@ -399,6 +402,57 @@ async def reconcile(
             ),
         }
         
+@app.get("/api/reconciliation/history")
+def get_reconciliation_history(
+    status: str | None = Query(None, max_length=30),
+    page: PageParam = DEFAULT_PAGE,
+    limit: LimitParam = DEFAULT_LIMIT,
+    session: Session = Depends(get_db_session),
+) -> dict[str, Any]:
+    """Return persisted reconciliation jobs, newest first.
+
+    The optional status filter is matched against the persisted job status.
+    A blank value is treated as omitted, matching the shared pagination
+    parameter convention.  No reconciliation is executed.
+    """
+
+    total, items = list_reconciliation_history(
+        session,
+        page=page,
+        limit=limit,
+        status=status,
+    )
+    total_pages = (total + limit - 1) // limit
+
+    return {
+        "total": total,
+        "page": page,
+        "limit": limit,
+        "total_pages": total_pages,
+        "has_next": page < total_pages,
+        "has_previous": page > 1,
+        "items": items,
+    }
+
+
+@app.get("/api/reconciliation/history/{job_id}")
+def get_reconciliation_history_detail(
+    job_id: uuid.UUID,
+    session: Session = Depends(get_db_session),
+) -> dict[str, Any]:
+    """Return one persisted reconciliation job without rerunning it."""
+
+    item = get_reconciliation_history_job(session, job_id)
+
+    if item is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Reconciliation job '{job_id}' was not found.",
+        )
+
+    return item
+
+
 @app.get("/api/reconciliation/{job_id}/summary")
 async def get_reconciliation_summary(
     job_id: uuid.UUID,
