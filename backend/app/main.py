@@ -412,6 +412,7 @@ async def reconcile(
             fund_request_filename=_safe_filename(fund_request_file.filename),
             va_transaction_filename=_safe_filename(va_transaction_file.filename),
             bank_files=bank_files_processed,
+            output=output,
         )
 
         # Schedule database persistence after returning the response.

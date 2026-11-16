@@ -292,10 +292,15 @@ def create_pending_job(
     fund_request_filename: str | None,
     va_transaction_filename: str | None,
     bank_files: list[dict[str, Any]],
+    output: ReconciliationOutput,
 ) -> uuid.UUID:
-    """Create a job before background persistence begins."""
+    """Create a pending job and save its summary immediately."""
 
     job_id = uuid.uuid4()
+
+    frontend_summary = build_frontend_summary(output)
+    overall = frontend_summary["overall"]
+    summary = output.summary
 
     with SessionLocal.begin() as session:
         job = ReconciliationJob(
@@ -307,96 +312,29 @@ def create_pending_job(
         )
         session.add(job)
 
+        session.add(
+            ReconciliationSummary(
+                job_id=job_id,
+                source_record_count=overall["total_source_records"],
+                bank_record_count=overall["total_bank_records"],
+                matched_count=overall["total_matched_records"],
+                matched_amount=Decimal(str(overall["total_matched_amount"])),
+                unmatched_bank_count=overall["total_unmatched_bank_records"],
+                unmatched_bank_amount=Decimal(
+                    str(overall["total_unmatched_bank_amount"])
+                ),
+                status_counts=_json_safe(summary.get("status_counts", {})),
+                by_source=_json_safe(
+                    {
+                        "fund_request": frontend_summary["fund_request"],
+                        "va_transaction": frontend_summary["va_transaction"],
+                    }
+                ),
+                summary_data=_json_safe(frontend_summary),
+            )
+        )
+
     return job_id
-
-
-# def save_reconciliation(
-#     output: ReconciliationOutput,
-#     *,
-#     fund_request_filename: str | None,
-#     va_transaction_filename: str | None,
-#     bank_files: list[dict[str, Any]],
-# ) -> uuid.UUID:
-#     """
-#     Persist one complete reconciliation job atomically.
-
-#     The matching engine is not called or modified here.
-#     """
-
-#     job_id = uuid.uuid4()
-#     summary = output.summary
-#     frontend_summary = build_frontend_summary(output)
-
-#     with SessionLocal.begin() as session:
-#         job = ReconciliationJob(
-#             job_id=job_id,
-#             status="COMPLETED",
-#             fund_request_filename=fund_request_filename,
-#             va_transaction_filename=va_transaction_filename,
-#             bank_files=_json_safe(bank_files),
-#             completed_at=datetime.now(timezone.utc),
-#         )
-
-#         session.add(job)
-#         session.flush()
-
-#         # Save results in batches to limit ORM memory overhead.
-#         batch_size = 1000
-#         result_batch = []
-
-#         for result in output.results:
-#             result_batch.append(_build_result_record(job_id, result))
-
-#             if len(result_batch) >= batch_size:
-#                 session.add_all(result_batch)
-#                 session.flush()
-#                 result_batch.clear()
-
-#         if result_batch:
-#             session.add_all(result_batch)
-#             session.flush()
-
-#         # Save unmatched bank transactions in batches.
-#         unmatched_batch = []
-
-#         for bank in output.unmatched_bank_rows:
-#             unmatched_batch.append(_build_unmatched_bank_record(job_id, bank))
-
-#             if len(unmatched_batch) >= batch_size:
-#                 session.add_all(unmatched_batch)
-#                 session.flush()
-#                 unmatched_batch.clear()
-
-#         if unmatched_batch:
-#             session.add_all(unmatched_batch)
-#             session.flush()
-
-#         # Save the original engine summary without changing its structure.
-#         overall = frontend_summary["overall"]
-
-#         session.add(
-#             ReconciliationSummary(
-#                 job_id=job_id,
-#                 source_record_count=overall["total_source_records"],
-#                 bank_record_count=overall["total_bank_records"],
-#                 matched_count=overall["total_matched_records"],
-#                 matched_amount=Decimal(str(overall["total_matched_amount"])),
-#                 unmatched_bank_count=overall["total_unmatched_bank_records"],
-#                 unmatched_bank_amount=Decimal(
-#                     str(overall["total_unmatched_bank_amount"])
-#                 ),
-#                 status_counts=_json_safe(summary.get("status_counts", {})),
-#                 by_source=_json_safe(
-#                     {
-#                         "fund_request": frontend_summary["fund_request"],
-#                         "va_transaction": frontend_summary["va_transaction"],
-#                     }
-#                 ),
-#                 summary_data=_json_safe(frontend_summary),
-#             )
-#         )
-
-#     return job_id
 
 
 def save_reconciliation(
@@ -453,30 +391,6 @@ def save_reconciliation(
         if unmatched_batch:
             session.add_all(unmatched_batch)
             session.flush()
-
-        overall = frontend_summary["overall"]
-
-        session.add(
-            ReconciliationSummary(
-                job_id=job_id,
-                source_record_count=overall["total_source_records"],
-                bank_record_count=overall["total_bank_records"],
-                matched_count=overall["total_matched_records"],
-                matched_amount=Decimal(str(overall["total_matched_amount"])),
-                unmatched_bank_count=overall["total_unmatched_bank_records"],
-                unmatched_bank_amount=Decimal(
-                    str(overall["total_unmatched_bank_amount"])
-                ),
-                status_counts=_json_safe(summary.get("status_counts", {})),
-                by_source=_json_safe(
-                    {
-                        "fund_request": frontend_summary["fund_request"],
-                        "va_transaction": frontend_summary["va_transaction"],
-                    }
-                ),
-                summary_data=_json_safe(frontend_summary),
-            )
-        )
 
         job.status = "COMPLETED"
         job.completed_at = datetime.now(timezone.utc)
