@@ -88,6 +88,19 @@ class ReconciliationResult(Base):
 
     exception_reason: Mapped[str | None] = mapped_column(String(1000))
 
+    # Manual settlement overlay.  Automatic evidence above is never rewritten.
+    match_type: Mapped[str | None] = mapped_column(String(30), nullable=True)
+
+    # Deliberately a plain UUID pointer rather than a foreign key.  Existing
+    # read-only test fixtures create this table without the companies table.
+    company_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True), nullable=True, index=True
+    )
+
+    settlement_remarks: Mapped[str | None] = mapped_column(
+        String(2000), nullable=True
+    )
+
     # Record creation timestamp
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),

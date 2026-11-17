@@ -143,3 +143,10 @@ class UnmatchedBankTransaction(Base):
         JSONB,
         nullable=True,
     )
+
+    # Set while an active manual settlement claims this bank row.  Unmatched
+    # queries filter on this column so settled rows disappear without deleting
+    # the original unmatched evidence.
+    active_settlement_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), nullable=True, index=True
+    )
