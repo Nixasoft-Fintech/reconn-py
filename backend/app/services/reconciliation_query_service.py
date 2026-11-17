@@ -279,7 +279,10 @@ def count_unmatched_bank_transactions(
     statement = (
         select(func.count())
         .select_from(UnmatchedBankTransaction)
-        .where(UnmatchedBankTransaction.job_id == job_id)
+        .where(
+            UnmatchedBankTransaction.job_id == job_id,
+            UnmatchedBankTransaction.active_settlement_id.is_(None),
+        )
     )
 
     return int(session.scalar(statement) or 0)
@@ -302,7 +305,10 @@ def list_unmatched_bank_transactions(
 
     statement = (
         select(UnmatchedBankTransaction)
-        .where(UnmatchedBankTransaction.job_id == job_id)
+        .where(
+            UnmatchedBankTransaction.job_id == job_id,
+            UnmatchedBankTransaction.active_settlement_id.is_(None),
+        )
         .order_by(UnmatchedBankTransaction.id.asc())
     )
 
@@ -447,6 +453,7 @@ def _aggregate_unmatched_bank_counts(
             func.count().label("record_count"),
         )
         .where(UnmatchedBankTransaction.job_id.in_(job_ids))
+        .where(UnmatchedBankTransaction.active_settlement_id.is_(None))
         .group_by(UnmatchedBankTransaction.job_id)
     )
 
@@ -723,7 +730,10 @@ def iter_unmatched_bank_transactions(
 
     statement = (
         select(UnmatchedBankTransaction)
-        .where(UnmatchedBankTransaction.job_id == job_id)
+        .where(
+            UnmatchedBankTransaction.job_id == job_id,
+            UnmatchedBankTransaction.active_settlement_id.is_(None),
+        )
         .order_by(UnmatchedBankTransaction.id.asc())
         .execution_options(yield_per=EXPORT_BATCH_SIZE)
     )
@@ -788,6 +798,9 @@ def serialize_result(row: ReconciliationResult) -> dict[str, Any]:
         "date_status": row.date_status,
         "final_status": row.final_status,
         "exception_reason": row.exception_reason,
+        "match_type": row.match_type,
+        "company_id": str(row.company_id) if row.company_id else None,
+        "settlement_remarks": row.settlement_remarks,
     }
 
 
@@ -842,4 +855,7 @@ def serialize_unmatched_bank(
         "date_status": None,
         "final_status": "NOT_FOUND",
         "exception_reason": None,
+        "match_type": None,
+        "company_id": None,
+        "settlement_remarks": None,
     }
