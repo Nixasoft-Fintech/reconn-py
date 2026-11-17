@@ -41,8 +41,8 @@ def test_reconcile_endpoint_returns_fund_request_and_va_results():
 
     payload = response.json()
 
-    assert payload["summary"]["source_record_count"] == 2
-    assert payload["summary"]["matched_count"] == 2
+    assert payload["summary"]["overall"]["total_source_records"] == 2
+    assert payload["summary"]["overall"]["total_matched_records"] == 2
     assert len(payload["results"]) == 2
 
     results_by_type = {result["source_type"]: result for result in payload["results"]}

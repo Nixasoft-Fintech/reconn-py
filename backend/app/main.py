@@ -52,6 +52,8 @@ from app.services.persistence_service import (
     create_pending_job,
     save_reconciliation_background,
     build_frontend_summary,
+    save_reconciliation,
+    retry_outputs,
 )
 from sqlalchemy import select
 from app.database.connection import SessionLocal
@@ -75,13 +77,51 @@ from app.services.reconciliation_query_service import (
     serialize_result,
     serialize_unmatched_bank,
 )
-from time import perf_counter
+from time import perf_counter, sleep
+from app.services.failure_classifier import get_failure_message
+from contextlib import asynccontextmanager
+import logging
 
 APP_TITLE = "Bank Statement Reconciliation API"
 MAX_UPLOAD_BYTES = 50 * 1024 * 1024
 CHUNK_SIZE = 1024 * 1024
 
-app = FastAPI(title=APP_TITLE, version="0.1.0")
+logger = logging.getLogger(__name__)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Recover reconciliation jobs interrupted by server restart."""
+
+    logger.info("Checking for interrupted reconciliation jobs...")
+
+    try:
+        with SessionLocal.begin() as session:
+            interrupted_jobs = (
+                session.query(ReconciliationJob)
+                .filter(ReconciliationJob.status.in_(["PROCESSING", "SAVING"]))
+                .all()
+            )
+
+            for job in interrupted_jobs:
+                job.status = "FAILED"
+                job.failure_code = "SERVER_RESTARTED"
+                job.failure_message = "Job interrupted because the server restarted."
+
+            logger.info(
+                "Startup recovery completed. Interrupted jobs: %s",
+                len(interrupted_jobs),
+            )
+
+    except Exception:
+        logger.exception("Could not recover interrupted reconciliation jobs.")
+
+    yield
+
+    logger.info("Application shutting down.")
+
+
+app = FastAPI(title=APP_TITLE, version="0.1.0", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
@@ -324,7 +364,7 @@ async def reconcile(
             bank_transactions = []
             bank_files_processed = []
 
-            for upload in bank_statement_file:
+            for bank_file_id, upload in enumerate(bank_statement_file, start=1):
                 bank_path = await _save_upload(upload, folder)
 
                 filename = _safe_filename(upload.filename)
@@ -357,14 +397,17 @@ async def reconcile(
                     metadata = read_result.metadata
 
                 # Always preserve the original uploaded filename.
+                # Always preserve the original uploaded filename and file ID.
                 for transaction in transactions:
                     transaction.source_filename = filename
+                    transaction.bank_file_id = bank_file_id
 
                 # Keep transaction records from all uploaded files.
                 bank_transactions.extend(transactions)
 
                 bank_files_processed.append(
                     {
+                        "bank_file_id": bank_file_id,
                         "file_name": filename,
                         "bank_name": profile_name,
                         "bank_format": bank_format,
@@ -417,34 +460,191 @@ async def reconcile(
             bank_files=bank_files_processed,
             output=output,
         )
-           # Schedule database persistence after returning the response.
+        # Schedule database persistence after returning the response.
         background_tasks.add_task(
-                    save_reconciliation_background,
-                    job_id,
-                    output,
-                )
-        
+            save_reconciliation_background,
+            job_id,
+            output,
+        )
+
         print("[PERF] Database persistence: scheduled in background")
-        
-            # Total endpoint execution time.
+
+        # Total endpoint execution time.
         total_time = perf_counter() - api_start
-        
+
         print(f"[PERF] Total API execution: {total_time:.2f}s")
-        
+
         return {
-                "job_id": str(job_id),
-                "status": "PENDING",
-                "summary": summary,
-                "bank_files_processed": bank_files_processed,
-                "notice": (
-                    "All uploaded bank statements were normalized separately "
-                    "and combined for reconciliation. Automatic bank detection "
-                    "was used unless manual mapping was supplied. Review "
-                    "unmatched transactions, duplicates and exceptions."
-                ),
+            "job_id": str(job_id),
+            "status": "PENDING",
+            "summary": summary,
+            "bank_files_processed": bank_files_processed,
+            "notice": (
+                "All uploaded bank statements were normalized separately "
+                "and combined for reconciliation. Automatic bank detection "
+                "was used unless manual mapping was supplied. Review "
+                "unmatched transactions, duplicates and exceptions."
+            ),
         }
-        
-        
+
+
+@app.post("/api/reconciliation/{job_id}/retry")
+def retry_reconciliation_persistence(
+    job_id: uuid.UUID,
+) -> dict[str, Any]:
+    """Retry persistence using the original in-memory reconciliation output."""
+
+    # Check whether the job exists.
+    with SessionLocal() as session:
+        job = session.get(ReconciliationJob, job_id)
+
+        if job is None:
+            raise HTTPException(
+                status_code=404,
+                detail="Reconciliation job not found.",
+            )
+
+        if job.status == "COMPLETED":
+            return {
+                "job_id": str(job_id),
+                "status": "COMPLETED",
+                "message": "This reconciliation job is already completed.",
+            }
+
+    # Retrieve the original reconciliation output.
+    output = retry_outputs.get(job_id)
+
+    if output is None:
+        raise HTTPException(
+            status_code=410,
+            detail=(
+                "Original reconciliation output is no longer available. "
+                "The backend may have restarted. Please upload the original "
+                "files and run reconciliation again."
+            ),
+        )
+
+    try:
+        save_reconciliation(job_id, output)
+
+        return {
+            "job_id": str(job_id),
+            "status": "COMPLETED",
+            "message": "Reconciliation data persisted successfully.",
+            "summary": build_frontend_summary(output),
+        }
+
+    except Exception as exc:
+        try:
+            with SessionLocal.begin() as session:
+                job = session.get(ReconciliationJob, job_id)
+
+                if job is not None and job.status != "COMPLETED":
+                    job.status = "FAILED"
+
+        except Exception:
+            pass
+
+        raise HTTPException(
+            status_code=503,
+            detail=f"Database persistence retry failed: {str(exc)}",
+        ) from exc
+
+
+@app.get("/api/reconciliation/{job_id}/events")
+def reconciliation_status_events(job_id: uuid.UUID):
+    """
+    Stream reconciliation job status changes using Server-Sent Events.
+    The connection closes when the job reaches COMPLETED or FAILED.
+    """
+
+    def event_stream():
+        last_status = None
+
+        while True:
+            try:
+                # Use a fresh database session for every status check.
+                with SessionLocal() as session:
+                    job = session.get(ReconciliationJob, job_id)
+
+                    if job is None:
+                        payload = {
+                            "job_id": str(job_id),
+                            "status": "NOT_FOUND",
+                            "message": "Reconciliation job not found.",
+                        }
+
+                        yield ("event: status\n" f"data: {json.dumps(payload)}\n\n")
+                        return
+
+                    # Copy values before closing the session.
+                    status = job.status
+                    failure_code = job.failure_code
+                    completed_at = (
+                        job.completed_at.isoformat() if job.completed_at else None
+                    )
+
+            except Exception:
+                logger.exception(
+                    "Failed to retrieve reconciliation status. Job ID: %s",
+                    job_id,
+                )
+
+                payload = {
+                    "job_id": str(job_id),
+                    "status": "STATUS_CHECK_ERROR",
+                    "message": (
+                        "We temporarily couldn't retrieve your reconciliation "
+                        "status. Please wait while we reconnect."
+                    ),
+                }
+
+                yield ("event: status\n" f"data: {json.dumps(payload)}\n\n")
+
+                sleep(2)
+                continue
+
+            # Send only when the status changes.
+            if status != last_status:
+                if status == "COMPLETED":
+                    message = (
+                        "Reconciliation completed successfully. "
+                        "Your results are ready."
+                    )
+                elif status == "FAILED":
+                    message = get_failure_message(failure_code)
+                else:
+                    message = "Reconciliation is being processed..."
+
+                payload = {
+                    "job_id": str(job_id),
+                    "status": status,
+                    "message": message,
+                    "failure_code": (failure_code if status == "FAILED" else None),
+                    "completed_at": completed_at,
+                }
+
+                yield ("event: status\n" f"data: {json.dumps(payload)}\n\n")
+
+                last_status = status
+
+            # Close after a terminal status.
+            if status in {"COMPLETED", "FAILED"}:
+                return
+
+            sleep(1)
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
 @app.get("/api/reconciliation/history")
 def get_reconciliation_history(
     status: str | None = Query(None, max_length=30),

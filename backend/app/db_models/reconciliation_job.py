@@ -1,7 +1,7 @@
 import uuid
 from datetime import datetime
 
-from sqlalchemy import DateTime, String, Uuid, func
+from sqlalchemy import DateTime, String, Uuid, func, Text
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -22,6 +22,16 @@ class ReconciliationJob(Base):
         nullable=False,
         default="PROCESSING",
     )
+
+    failure_message: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True,
+    )
+
+    failure_code: Mapped[str | None] = mapped_column(
+    String(50),
+    nullable=True,
+)
 
     fund_request_filename: Mapped[str | None] = mapped_column(
         String(255),

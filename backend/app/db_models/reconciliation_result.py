@@ -69,6 +69,10 @@ class ReconciliationResult(Base):
     bank_account_holder: Mapped[str | None] = mapped_column(String(255))
     bank_format: Mapped[str | None] = mapped_column(String(100))
     bank_source_filename: Mapped[str | None] = mapped_column(String(255))
+    bank_file_id: Mapped[int | None] = mapped_column(
+        Integer,
+        nullable=True,
+    )
 
     bank_extracted_references: Mapped[list | None] = mapped_column(JSONB)
 
@@ -97,9 +101,7 @@ class ReconciliationResult(Base):
         Uuid(as_uuid=True), nullable=True, index=True
     )
 
-    settlement_remarks: Mapped[str | None] = mapped_column(
-        String(2000), nullable=True
-    )
+    settlement_remarks: Mapped[str | None] = mapped_column(String(2000), nullable=True)
 
     # Record creation timestamp
     created_at: Mapped[datetime] = mapped_column(

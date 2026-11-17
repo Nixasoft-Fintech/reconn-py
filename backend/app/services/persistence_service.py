@@ -1,4 +1,11 @@
 from __future__ import annotations
+from asyncio.log import logger
+import time
+import threading
+from sqlalchemy import text
+
+from sqlalchemy.exc import DBAPIError, OperationalError
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 import math
 import uuid
@@ -16,6 +23,24 @@ from app.db_models import (
 )
 from app.models.reconciliation import ReconciliationOutput
 import logging
+from app.services.failure_classifier import classify_failure
+
+retry_outputs = {}
+_job_locks = {}
+_job_locks_guard = threading.Lock()
+
+
+def get_job_lock(job_id):
+    with _job_locks_guard:
+        if job_id not in _job_locks:
+            _job_locks[job_id] = threading.Lock()
+        return _job_locks[job_id]
+
+
+def is_transient_db_error(exc):
+    return isinstance(exc, OperationalError) or (
+        isinstance(exc, DBAPIError) and exc.connection_invalidated
+    )
 
 
 def _json_safe(value: Any) -> Any:
@@ -244,6 +269,7 @@ def _build_result_record(job_id: uuid.UUID, result) -> ReconciliationResult:
         bank_account_holder=bank.account_holder if bank else None,
         bank_format=bank.bank_format if bank else None,
         bank_source_filename=bank.source_filename if bank else None,
+        bank_file_id=bank.bank_file_id if bank else None,
         bank_extracted_references=(
             _json_safe(bank.extracted_references) if bank else None
         ),
@@ -281,6 +307,7 @@ def _build_unmatched_bank_record(
         account_holder=bank.account_holder,
         bank_format=bank.bank_format,
         source_filename=bank.source_filename,
+        bank_file_id=bank.bank_file_id,
         signed_amount=bank.signed_amount,
         value_date=_aware_datetime(bank.value_date),
         extracted_references=_json_safe(bank.extracted_references),
@@ -334,97 +361,214 @@ def create_pending_job(
             )
         )
 
+    retry_outputs[job_id] = output
     return job_id
+
+
+def _record_values(records):
+    values = []
+
+    for record in records:
+        row = {
+            key: value
+            for key, value in record.__dict__.items()
+            if not key.startswith("_") and key != "id"
+        }
+        values.append(row)
+
+    return values
+
+
+def _save_batch_with_retry(model, records, conflict_columns, conflict_condition):
+    if not records:
+        return
+
+    values = _record_values(records)
+    table = model.__table__
+
+    statement = (
+        pg_insert(table)
+        .values(values)
+        .on_conflict_do_nothing(
+            index_elements=[table.c[column.key] for column in conflict_columns],
+            index_where=conflict_condition,
+        )
+    )
+
+    for attempt in range(1, 4):
+        try:
+            # A fresh session and transaction for every attempt.
+            with SessionLocal.begin() as session:
+                session.execute(statement)
+
+            if attempt > 1:
+                logger.info(
+                    "Database batch successfully saved on attempt %s/3",
+                    attempt,
+                )
+
+            return
+
+        except (OperationalError, DBAPIError) as exc:
+            if not is_transient_db_error(exc) or attempt == 3:
+                raise
+
+            logger.warning(
+                "Database retry %s/3 failed: %s",
+                attempt,
+                exc,
+            )
+
+            time.sleep(attempt * 2)
 
 
 def save_reconciliation(
     job_id: uuid.UUID,
     output: ReconciliationOutput,
 ) -> None:
-    """
-    Persist reconciliation results for an existing pending job.
+    """Persist results in retry-safe, independently committed batches."""
 
-    The matching engine is not called or modified here.
-    """
+    lock = get_job_lock(job_id)
 
-    summary = output.summary
-    frontend_summary = build_frontend_summary(output)
+    with lock:
+        # Check job status using a separate short transaction.
+        with SessionLocal.begin() as session:
+            job = session.get(ReconciliationJob, job_id)
 
-    with SessionLocal.begin() as session:
-        job = session.get(ReconciliationJob, job_id)
+            if job is None:
+                raise ValueError(f"Reconciliation job {job_id} not found.")
 
-        if job is None:
-            raise ValueError(f"Reconciliation job {job_id} not found.")
+            if job.status == "COMPLETED":
+                retry_outputs.pop(job_id, None)
+                return
 
-        if job.status != "PENDING":
-            raise ValueError(
-                f"Job {job_id} is not pending. Current status: {job.status}"
-            )
-
-        job.status = "SAVING"
+            job.status = "SAVING"
+            job.failure_code = None
+            job.failure_message = None
 
         batch_size = 1000
+
+        # Save reconciliation results.
         result_batch = []
 
         for result in output.results:
             result_batch.append(_build_result_record(job_id, result))
 
             if len(result_batch) >= batch_size:
-                session.add_all(result_batch)
-                session.flush()
+                _save_batch_with_retry(
+                    ReconciliationResult,
+                    result_batch,
+                    [
+                        ReconciliationResult.job_id,
+                        ReconciliationResult.source_type,
+                        ReconciliationResult.source_row_number,
+                    ],
+                    text("source_row_number IS NOT NULL"),
+                )
                 result_batch.clear()
 
         if result_batch:
-            session.add_all(result_batch)
-            session.flush()
+            _save_batch_with_retry(
+                ReconciliationResult,
+                result_batch,
+                [
+                    ReconciliationResult.job_id,
+                    ReconciliationResult.source_type,
+                    ReconciliationResult.source_row_number,
+                ],
+                text("source_row_number IS NOT NULL"),
+            )
 
+        # Save unmatched bank transactions.
         unmatched_batch = []
 
         for bank in output.unmatched_bank_rows:
             unmatched_batch.append(_build_unmatched_bank_record(job_id, bank))
 
             if len(unmatched_batch) >= batch_size:
-                session.add_all(unmatched_batch)
-                session.flush()
+                _save_batch_with_retry(
+                    UnmatchedBankTransaction,
+                    unmatched_batch,
+                    [
+                        UnmatchedBankTransaction.job_id,
+                        UnmatchedBankTransaction.bank_file_id,
+                        UnmatchedBankTransaction.statement_row_number,
+                    ],
+                    text(
+                        "bank_file_id IS NOT NULL "
+                        "AND statement_row_number IS NOT NULL"
+                    ),
+                )
                 unmatched_batch.clear()
 
         if unmatched_batch:
-            session.add_all(unmatched_batch)
-            session.flush()
+            _save_batch_with_retry(
+                UnmatchedBankTransaction,
+                unmatched_batch,
+                [
+                    UnmatchedBankTransaction.job_id,
+                    UnmatchedBankTransaction.bank_file_id,
+                    UnmatchedBankTransaction.statement_row_number,
+                ],
+                text(
+                    "bank_file_id IS NOT NULL " "AND statement_row_number IS NOT NULL"
+                ),
+            )
 
-        job.status = "COMPLETED"
-        job.completed_at = datetime.now(timezone.utc)
+        # Mark completed only after every batch is persisted.
+        with SessionLocal.begin() as session:
+            job = session.get(ReconciliationJob, job_id)
 
+            if job is None:
+                raise ValueError(f"Reconciliation job {job_id} not found.")
 
-logger = logging.getLogger(__name__)
+            job.status = "COMPLETED"
+            job.completed_at = datetime.now(timezone.utc)
+            job.failure_code = None
+            job.failure_message = None
+
+        # Remove cached output only after successful completion.
+        retry_outputs.pop(job_id, None)
 
 
 def save_reconciliation_background(
     job_id: uuid.UUID,
     output: ReconciliationOutput,
 ) -> None:
-    """Save reconciliation results and record persistence failures."""
+    """Save reconciliation results and retain output if persistence fails."""
 
     try:
         save_reconciliation(job_id, output)
 
-        print(
-            f"[PERF] Database persistence completed successfully. " f"Job ID: {job_id}",
-            flush=True,
+        logger.info(
+            "Database persistence completed. Job ID: %s",
+            job_id,
         )
 
     except Exception as exc:
-        print(
-            f"[PERF] Database persistence FAILED. " f"Job ID: {job_id}. Error: {exc}",
-            flush=True,
+        logger.exception(
+            "Database persistence failed. Job ID: %s",
+            job_id,
+        )
+
+        failure_code = classify_failure(exc)
+
+        failure_message = f"{type(exc).__name__}: {str(exc)[:1000]}"
+
+        logger.error(
+            "Job failure classified. Job ID: %s | Code: %s",
+            job_id,
+            failure_code,
         )
 
         try:
             with SessionLocal.begin() as session:
                 job = session.get(ReconciliationJob, job_id)
 
-                if job is not None:
+                if job is not None and job.status != "COMPLETED":
                     job.status = "FAILED"
+                    job.failure_code = failure_code
+                    job.failure_message = failure_message
 
         except Exception:
             logger.exception(

@@ -28,6 +28,7 @@ class BankTransaction:
     account_holder: str | None = None
     bank_format: str | None = None
     source_filename: str | None = None
+    bank_file_id: int | None = None
 
     value_date: datetime | None = None
 
@@ -68,6 +69,7 @@ class BankTransaction:
             "account_holder": self.account_holder,
             "bank_format": self.bank_format,
             "source_filename": self.source_filename,
+            "bank_file_id": self.bank_file_id,
             "extracted_references": self.extracted_references,
         }
 

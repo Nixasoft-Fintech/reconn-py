@@ -39,7 +39,6 @@ class UnmatchedBankTransaction(Base):
         nullable=False,
     )
 
-
     statement_row_number: Mapped[int | None] = mapped_column(
         Integer,
         nullable=True,
@@ -126,6 +125,11 @@ class UnmatchedBankTransaction(Base):
 
     source_filename: Mapped[str | None] = mapped_column(
         String(255),
+        nullable=True,
+    )
+
+    bank_file_id: Mapped[int | None] = mapped_column(
+        Integer,
         nullable=True,
     )
 
