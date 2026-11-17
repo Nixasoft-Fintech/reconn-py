@@ -55,8 +55,25 @@ from app.services.persistence_service import (
     save_reconciliation,
     retry_outputs,
 )
+from app.schemas.company import CompanyCreate
+from app.schemas.manual_settlement import (
+    ManualSettlementCreate,
+    ManualSettlementReversal,
+)
+from app.services.company_service import (
+    create_company,
+    get_company,
+    list_companies,
+    serialize_company,
+)
+from app.services.errors import ServiceError
+from app.services.manual_settlement_service import (
+    create_manual_settlement,
+    list_manual_settlements,
+    reverse_manual_settlement,
+    serialize_settlement,
+)
 from sqlalchemy import select
-from app.database.connection import SessionLocal
 from app.db_models.reconciliation_job import ReconciliationJob
 from app.db_models.reconciliation_summary import ReconciliationSummary
 from app.services.reconciliation_query_service import (
@@ -699,40 +716,183 @@ def get_reconciliation_history_detail(
 @app.get("/api/reconciliation/{job_id}/summary")
 async def get_reconciliation_summary(
     job_id: uuid.UUID,
+    session: Session = Depends(get_db_session),
 ) -> dict[str, Any]:
     """
     Retrieve the saved summary for a reconciliation job.
     """
 
-    with SessionLocal() as session:
+    job = session.get(ReconciliationJob, job_id)
 
-        job = session.get(ReconciliationJob, job_id)
-
-        if job is None:
-            raise HTTPException(
-                status_code=404,
-                detail="Reconciliation job not found.",
-            )
-
-        summary_record = session.scalar(
-            select(ReconciliationSummary).where(ReconciliationSummary.job_id == job_id)
+    if job is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Reconciliation job not found.",
         )
 
-        if summary_record is None:
-            raise HTTPException(
-                status_code=404,
-                detail="Summary not found for this reconciliation job.",
-            )
+    summary_record = session.scalar(
+        select(ReconciliationSummary).where(ReconciliationSummary.job_id == job_id)
+    )
 
-        return {
-            "job_id": str(job.job_id),
-            "status": job.status,
-            "created_at": (job.created_at.isoformat() if job.created_at else None),
-            "completed_at": (
-                job.completed_at.isoformat() if job.completed_at else None
-            ),
-            "summary": summary_record.summary_data,
-        }
+    if summary_record is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Summary not found for this reconciliation job.",
+        )
+
+    return {
+        "job_id": str(job.job_id),
+        "status": job.status,
+        "created_at": (job.created_at.isoformat() if job.created_at else None),
+        "completed_at": (
+            job.completed_at.isoformat() if job.completed_at else None
+        ),
+        "summary": summary_record.summary_data,
+    }
+
+
+def _raise_service_error(exc: ServiceError) -> None:
+    """Translate an expected service failure into an HTTP response."""
+
+    raise HTTPException(status_code=exc.status_code, detail=str(exc))
+
+
+@app.post("/api/companies", status_code=201)
+def create_company_endpoint(
+    payload: CompanyCreate,
+    session: Session = Depends(get_db_session),
+) -> dict[str, Any]:
+    """Create a reusable company record."""
+
+    try:
+        company = create_company(
+            session,
+            name=payload.name,
+            alias=payload.alias,
+        )
+    except ServiceError as exc:
+        _raise_service_error(exc)
+
+    return serialize_company(company)
+
+
+@app.get("/api/companies")
+def list_companies_endpoint(
+    search: str | None = Query(None, max_length=255),
+    page: PageParam = DEFAULT_PAGE,
+    limit: LimitParam = DEFAULT_LIMIT,
+    session: Session = Depends(get_db_session),
+) -> dict[str, Any]:
+    """Return companies sorted alphabetically by name."""
+
+    total, items = list_companies(
+        session,
+        page=page,
+        limit=limit,
+        search=search,
+    )
+    total_pages = (total + limit - 1) // limit
+
+    return {
+        "total": total,
+        "page": page,
+        "limit": limit,
+        "total_pages": total_pages,
+        "has_next": page < total_pages,
+        "has_previous": page > 1,
+        "items": [serialize_company(company) for company in items],
+    }
+
+
+@app.get("/api/companies/{company_id}")
+def get_company_endpoint(
+    company_id: uuid.UUID,
+    session: Session = Depends(get_db_session),
+) -> dict[str, Any]:
+    """Return one company by id."""
+
+    try:
+        company = get_company(session, company_id)
+    except ServiceError as exc:
+        _raise_service_error(exc)
+
+    return serialize_company(company)
+
+
+@app.post(
+    "/api/reconciliation/{job_id}/manual-settlements",
+    status_code=201,
+)
+def create_manual_settlement_endpoint(
+    job_id: uuid.UUID,
+    payload: ManualSettlementCreate,
+    session: Session = Depends(get_db_session),
+) -> dict[str, Any]:
+    """Settle one source record against one bank row."""
+
+    try:
+        settlement = create_manual_settlement(session, job_id, payload)
+    except ServiceError as exc:
+        _raise_service_error(exc)
+
+    return serialize_settlement(session, settlement)
+
+
+@app.get("/api/reconciliation/{job_id}/manual-settlements")
+def list_manual_settlements_endpoint(
+    job_id: uuid.UUID,
+    page: PageParam = DEFAULT_PAGE,
+    limit: LimitParam = DEFAULT_LIMIT,
+    session: Session = Depends(get_db_session),
+) -> dict[str, Any]:
+    """Return manual settlements for one job, newest first."""
+
+    try:
+        total, items = list_manual_settlements(
+            session,
+            job_id,
+            page=page,
+            limit=limit,
+        )
+    except ServiceError as exc:
+        _raise_service_error(exc)
+
+    total_pages = (total + limit - 1) // limit
+
+    return {
+        "job_id": str(job_id),
+        "total": total,
+        "page": page,
+        "limit": limit,
+        "total_pages": total_pages,
+        "has_next": page < total_pages,
+        "has_previous": page > 1,
+        "items": [serialize_settlement(session, item) for item in items],
+    }
+
+
+@app.post(
+    "/api/reconciliation/manual-settlements/{settlement_id}/reverse",
+)
+def reverse_manual_settlement_endpoint(
+    settlement_id: uuid.UUID,
+    payload: ManualSettlementReversal | None = None,
+    session: Session = Depends(get_db_session),
+) -> dict[str, Any]:
+    """Reverse an active manual settlement and restore both records."""
+
+    reason = payload.reason if payload is not None else None
+
+    try:
+        settlement = reverse_manual_settlement(
+            session,
+            settlement_id,
+            reason=reason,
+        )
+    except ServiceError as exc:
+        _raise_service_error(exc)
+
+    return serialize_settlement(session, settlement)
 
 
 FundRequestStatus = Literal["MATCHED", "NOT_FOUND"]
