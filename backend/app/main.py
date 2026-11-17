@@ -97,6 +97,7 @@ from app.services.reconciliation_query_service import (
 from time import perf_counter, sleep
 from app.services.failure_classifier import get_failure_message
 from contextlib import asynccontextmanager
+from app.database.connection import SessionLocal
 import logging
 
 APP_TITLE = "Bank Statement Reconciliation API"
@@ -611,8 +612,8 @@ def reconciliation_status_events(job_id: uuid.UUID):
                     "job_id": str(job_id),
                     "status": "STATUS_CHECK_ERROR",
                     "message": (
-                        "We temporarily couldn't retrieve your reconciliation "
-                        "status. Please wait while we reconnect."
+                        "We couldn't retrieve your reconciliation status because "
+                        "the database is temporarily unavailable. We'll try again."
                     ),
                 }
 
@@ -744,9 +745,7 @@ async def get_reconciliation_summary(
         "job_id": str(job.job_id),
         "status": job.status,
         "created_at": (job.created_at.isoformat() if job.created_at else None),
-        "completed_at": (
-            job.completed_at.isoformat() if job.completed_at else None
-        ),
+        "completed_at": (job.completed_at.isoformat() if job.completed_at else None),
         "summary": summary_record.summary_data,
     }
 
