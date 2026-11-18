@@ -87,12 +87,42 @@ def _json_safe(value: Any) -> Any:
     return str(value)
 
 
-def _bank_key(filename: str, row_number: int) -> str:
-    return f"{filename}#{row_number}"
+def _bank_key(
+    filename: str | None,
+    row_number: int | None,
+) -> str:
+    """Build the human-readable bank key used in settlement history."""
+
+    if row_number is None:
+        return filename or "bank"
+
+    return f"{filename or ''}#{row_number}"
 
 
-def _bank_identity(ref: TransactionReference) -> tuple[str, int]:
-    return str(ref.bank_source_filename), int(ref.bank_row_number)
+def _unmatched_bank_id(ref: TransactionReference) -> int:
+    """Return the numeric unmatched bank id carried by a bank reference."""
+
+    if not ref.transaction_id:
+        raise ValidationError(
+            "A bank transaction that is not already linked to the selected "
+            "source record must be referenced by transaction_id."
+        )
+
+    try:
+        bank_id = int(ref.transaction_id)
+    except (TypeError, ValueError) as exc:
+        raise ValidationError(
+            "transaction_id must be the positive numeric id of an unmatched "
+            "bank transaction."
+        ) from exc
+
+    if bank_id < 1:
+        raise ValidationError(
+            "transaction_id must be the positive numeric id of an unmatched "
+            "bank transaction."
+        )
+
+    return bank_id
 
 
 def _snapshot_from_result(result: ReconciliationResult) -> dict[str, Any]:
@@ -251,79 +281,81 @@ def _resolve_source(
     return result
 
 
-def _find_linked_results(
-    session: Session,
-    job_id: uuid.UUID,
-    filename: str,
-    row_number: int,
-) -> list[ReconciliationResult]:
-    return list(
-        session.scalars(
-            select(ReconciliationResult).where(
-                ReconciliationResult.job_id == job_id,
-                ReconciliationResult.bank_source_filename == filename,
-                ReconciliationResult.bank_row_number == row_number,
-            )
-        )
-    )
-
-
 def _resolve_unmatched_bank(
     session: Session,
     job_id: uuid.UUID,
-    ref: TransactionReference,
-) -> UnmatchedBankTransaction | None:
-    filename, row_number = _bank_identity(ref)
+    bank_id: int,
+) -> UnmatchedBankTransaction:
+    """Lock and return one eligible unmatched bank row for this job.
 
-    rows = list(
-        session.scalars(
-            select(UnmatchedBankTransaction)
-            .where(
-                UnmatchedBankTransaction.job_id == job_id,
-                UnmatchedBankTransaction.source_filename == filename,
-                UnmatchedBankTransaction.statement_row_number == row_number,
-                UnmatchedBankTransaction.active_settlement_id.is_(None),
-            )
-            .with_for_update()
+    The row is identified by its primary key, never by its filename or
+    statement row number.  Rows already claimed by an active settlement are
+    rejected, and rows from another job are reported as not found.
+    """
+
+    row = session.scalar(
+        select(UnmatchedBankTransaction)
+        .where(
+            UnmatchedBankTransaction.id == bank_id,
+            UnmatchedBankTransaction.job_id == job_id,
+            UnmatchedBankTransaction.active_settlement_id.is_(None),
+        )
+        .with_for_update()
+    )
+
+    if row is not None:
+        return row
+
+    existing = session.scalar(
+        select(UnmatchedBankTransaction).where(
+            UnmatchedBankTransaction.id == bank_id,
+            UnmatchedBankTransaction.job_id == job_id,
         )
     )
 
-    if len(rows) > 1:
+    if existing is not None:
         raise ConflictError(
-            f"Multiple unmatched bank rows use identity "
-            f"'{_bank_key(filename, row_number)}'."
+            f"Bank transaction '{bank_id}' already has an active manual "
+            "settlement."
         )
 
-    return rows[0] if rows else None
+    raise NotFoundError(
+        f"Bank transaction '{bank_id}' was not found in job '{job_id}'."
+    )
 
 
 def _guard_bank_target(
     session: Session,
     job_id: uuid.UUID,
-    filename: str,
-    row_number: int,
-) -> str:
-    key = _bank_key(filename, row_number)
+    *,
+    unmatched_id: int | None = None,
+    linked_key: str | None = None,
+) -> None:
+    """Reject a bank row that an active settlement already claims."""
 
-    if _active_target_exists(
+    if unmatched_id is not None and _active_target_exists(
         session,
         job_id,
         transaction_type="bank",
         record_type="unmatched_bank",
-        record_id=key,
-    ) or _active_target_exists(
+        record_id=str(unmatched_id),
+    ):
+        raise ConflictError(
+            f"Bank transaction '{unmatched_id}' already has an active manual "
+            "settlement."
+        )
+
+    if linked_key is not None and _active_target_exists(
         session,
         job_id,
         transaction_type="bank",
         record_type="linked_bank",
-        record_id=key,
+        record_id=linked_key,
     ):
         raise ConflictError(
-            f"Bank transaction '{key}' already has an active manual "
+            f"Bank transaction '{linked_key}' already has an active manual "
             "settlement."
         )
-
-    return key
 
 
 def _resolve_bank_counterpart(
@@ -331,38 +363,51 @@ def _resolve_bank_counterpart(
     job_id: uuid.UUID,
     ref: TransactionReference,
     source: ReconciliationResult,
-) -> tuple[str, UnmatchedBankTransaction | None, dict[str, Any]]:
-    """Resolve the bank side for a source-primary settlement."""
+) -> tuple[str, UnmatchedBankTransaction | None, dict[str, Any], str]:
+    """Resolve the bank side for a source-primary settlement.
 
-    filename, row_number = _bank_identity(ref)
-    _guard_bank_target(session, job_id, filename, row_number)
+    A source that already carries a linked bank row is settled against that
+    row.  Otherwise the caller must supply the unmatched bank id.
+    """
 
     if source.bank_row_number is not None:
-        if (
-            source.bank_source_filename != filename
-            or source.bank_row_number != row_number
-        ):
+        if ref.transaction_id is not None:
             raise ValidationError(
-                "The selected source record already has a different linked "
-                "bank row. Use that row as the counterpart."
+                "The selected source record already has a linked bank row. "
+                "Omit transaction_id from the bank reference."
             )
 
-        return "linked_bank", None, _snapshot_from_result(source)
+        linked_key = _bank_key(
+            source.bank_source_filename,
+            source.bank_row_number,
+        )
+        _guard_bank_target(session, job_id, linked_key=linked_key)
 
-    unmatched = _resolve_unmatched_bank(session, job_id, ref)
-
-    if unmatched is not None:
-        return "unmatched_bank", unmatched, _snapshot_from_unmatched(unmatched)
-
-    if _find_linked_results(session, job_id, filename, row_number):
-        raise ValidationError(
-            f"Bank transaction '{_bank_key(filename, row_number)}' is linked "
-            "to another source record and cannot be used as the counterpart."
+        return (
+            "linked_bank",
+            None,
+            _snapshot_from_result(source),
+            linked_key,
         )
 
-    raise NotFoundError(
-        f"Bank transaction '{_bank_key(filename, row_number)}' was not found "
-        f"in job '{job_id}'."
+    bank_id = _unmatched_bank_id(ref)
+    unmatched = _resolve_unmatched_bank(session, job_id, bank_id)
+    bank_key = _bank_key(
+        unmatched.source_filename,
+        unmatched.statement_row_number,
+    )
+    _guard_bank_target(
+        session,
+        job_id,
+        unmatched_id=unmatched.id,
+        linked_key=bank_key,
+    )
+
+    return (
+        "unmatched_bank",
+        unmatched,
+        _snapshot_from_unmatched(unmatched),
+        bank_key,
     )
 
 
@@ -370,28 +415,23 @@ def _resolve_bank_primary(
     session: Session,
     job_id: uuid.UUID,
     ref: TransactionReference,
-) -> tuple[UnmatchedBankTransaction, dict[str, Any]]:
+) -> tuple[UnmatchedBankTransaction, dict[str, Any], str]:
     """Resolve the bank side for a bank-primary settlement."""
 
-    filename, row_number = _bank_identity(ref)
-    _guard_bank_target(session, job_id, filename, row_number)
+    bank_id = _unmatched_bank_id(ref)
+    unmatched = _resolve_unmatched_bank(session, job_id, bank_id)
+    bank_key = _bank_key(
+        unmatched.source_filename,
+        unmatched.statement_row_number,
+    )
+    _guard_bank_target(
+        session,
+        job_id,
+        unmatched_id=unmatched.id,
+        linked_key=bank_key,
+    )
 
-    unmatched = _resolve_unmatched_bank(session, job_id, ref)
-
-    if unmatched is None:
-        if _find_linked_results(session, job_id, filename, row_number):
-            raise ValidationError(
-                f"Bank transaction '{_bank_key(filename, row_number)}' is "
-                "linked to a source record and cannot be used as the primary "
-                "record."
-            )
-
-        raise NotFoundError(
-            f"Bank transaction '{_bank_key(filename, row_number)}' was not "
-            f"found in job '{job_id}'."
-        )
-
-    return unmatched, _snapshot_from_unmatched(unmatched)
+    return unmatched, _snapshot_from_unmatched(unmatched), bank_key
 
 
 def _effective_remarks(remarks: str | None) -> str:
@@ -534,11 +574,19 @@ def create_manual_settlement(
             bank_role = "PRIMARY"
 
             source = _resolve_source(session, job_id, source_ref)
-            unmatched, unmatched_snapshot = _resolve_bank_primary(
-                session, job_id, bank_ref
-            )
+
+            if source.bank_row_number is not None:
+                raise ValidationError(
+                    "The selected source record already has a linked bank "
+                    "row and cannot be settled against a different bank."
+                )
+
+            (
+                unmatched,
+                unmatched_snapshot,
+                bank_key,
+            ) = _resolve_bank_primary(session, job_id, bank_ref)
             bank_kind = "unmatched_bank"
-            bank_filename, bank_row_number = _bank_identity(bank_ref)
         else:
             source_ref = primary
             bank_ref = counterpart
@@ -550,10 +598,8 @@ def create_manual_settlement(
                 bank_kind,
                 unmatched,
                 unmatched_snapshot,
+                bank_key,
             ) = _resolve_bank_counterpart(session, job_id, bank_ref, source)
-            bank_filename, bank_row_number = _bank_identity(bank_ref)
-
-        bank_key = _bank_key(bank_filename, bank_row_number)
 
         original_status = source.final_status
         original_match_type = source.match_type
@@ -561,16 +607,8 @@ def create_manual_settlement(
         original_settlement_remarks = source.settlement_remarks
         original_bank_snapshot = _snapshot_from_result(source)
 
-        if source.bank_row_number is None:
+        if bank_kind == "unmatched_bank":
             _apply_bank_snapshot(source, unmatched_snapshot)
-        elif (
-            source.bank_source_filename != bank_filename
-            or source.bank_row_number != bank_row_number
-        ):
-            raise ValidationError(
-                "The selected source record is already linked to a different "
-                "bank row."
-            )
 
         settlement_id = uuid.uuid4()
         effective_remarks = _effective_remarks(payload.remarks)
@@ -583,13 +621,13 @@ def create_manual_settlement(
             status="ACTIVE",
             primary_transaction_type=primary.transaction_type,
             primary_record_key=(
-                _bank_key(*_bank_identity(primary))
+                bank_key
                 if primary.transaction_type == "bank"
                 else (primary.transaction_id or "")
             ),
             counterpart_transaction_type=counterpart.transaction_type,
             counterpart_record_key=(
-                _bank_key(*_bank_identity(counterpart))
+                bank_key
                 if counterpart.transaction_type == "bank"
                 else (counterpart.transaction_id or "")
             ),
@@ -631,7 +669,7 @@ def create_manual_settlement(
                     role=bank_role,
                     transaction_type="bank",
                     record_type="unmatched_bank",
-                    record_id=bank_key,
+                    record_id=str(unmatched.id),
                     record_key=bank_key,
                     unmatched_bank_id=unmatched.id,
                     original_status="NOT_FOUND",

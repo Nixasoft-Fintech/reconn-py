@@ -643,6 +643,14 @@ def test_bank_unmatched_returns_only_persisted_unmatched_rows(
     by_row = {item["bank_row_number"]: item for item in payload["items"]}
 
     assert set(by_row) == {10, 11}
+    assert all(
+        isinstance(item["bank_transaction_id"], int)
+        for item in payload["items"]
+    )
+    assert (
+        by_row[10]["bank_transaction_id"]
+        != by_row[11]["bank_transaction_id"]
+    )
 
     for item in payload["items"]:
         assert item["final_status"] == "NOT_FOUND"
