@@ -54,6 +54,7 @@ from app.services.persistence_service import (
     build_frontend_summary,
     save_reconciliation,
     retry_outputs,
+    _bank_debit_credit,
 )
 from app.schemas.company import CompanyCreate
 from app.schemas.manual_settlement import (
@@ -109,10 +110,6 @@ logger = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Recover reconciliation jobs interrupted by server restart."""
-
-    logger.info("Checking for interrupted reconciliation jobs...")
-
     try:
         with SessionLocal.begin() as session:
             interrupted_jobs = (
@@ -126,23 +123,20 @@ async def lifespan(app: FastAPI):
                 job.failure_code = "SERVER_RESTARTED"
                 job.failure_message = "Job interrupted because the server restarted."
 
-            logger.info(
-                "Startup recovery completed. Interrupted jobs: %s",
-                len(interrupted_jobs),
-            )
-
-    except Exception:
-        logger.exception("Could not recover interrupted reconciliation jobs.")
+    except Exception as exc:
+        logger.error(f"[LIFESPAN] Recovery failed: {exc!r}")
+        raise
 
     yield
-
-    logger.info("Application shutting down.")
 
 
 app = FastAPI(title=APP_TITLE, version="0.1.0", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
+    allow_origins=[
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+    ],
     allow_credentials=True,
     allow_methods=["GET", "POST"],
     allow_headers=["*"],
@@ -420,8 +414,14 @@ async def reconcile(
                     transaction.source_filename = filename
                     transaction.bank_file_id = bank_file_id
 
-                # Keep transaction records from all uploaded files.
-                bank_transactions.extend(transactions)
+                # Keep only credit transactions for reconciliation.
+                credit_transactions = [
+                    transaction
+                    for transaction in transactions
+                    if _bank_debit_credit(transaction)[1] is not None
+                ]
+
+                bank_transactions.extend(credit_transactions)
 
                 bank_files_processed.append(
                     {
@@ -431,7 +431,7 @@ async def reconcile(
                         "bank_format": bank_format,
                         "account_number": metadata.get("account_number"),
                         "account_holder": metadata.get("account_holder"),
-                        "transaction_count": len(transactions),
+                        "transaction_count": len(credit_transactions),
                     }
                 )
 

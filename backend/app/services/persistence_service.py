@@ -479,11 +479,22 @@ def save_reconciliation(
                 text("source_row_number IS NOT NULL"),
             )
 
-        # Save unmatched bank transactions.
+  
+
+        # Save only unmatched credit bank transactions.
         unmatched_batch = []
 
         for bank in output.unmatched_bank_rows:
-            unmatched_batch.append(_build_unmatched_bank_record(job_id, bank))
+            debit, credit = _bank_debit_credit(bank)
+
+            # Skip debit and unidentified transactions.
+            if credit is None:
+                continue
+
+            unmatched_batch.append(
+                _build_unmatched_bank_record(job_id, bank)
+            )
+
 
             if len(unmatched_batch) >= batch_size:
                 _save_batch_with_retry(
