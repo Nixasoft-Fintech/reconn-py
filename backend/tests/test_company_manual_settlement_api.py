@@ -200,10 +200,11 @@ def _add_unmatched_bank(
     amount=Decimal("100.0000"),
     utr="UTR-BANK",
     source_filename="axis.csv",
+    job_id=JOB,
 ):
     session.add(
         UnmatchedBankTransaction(
-            job_id=JOB,
+            job_id=job_id,
             bank_name="AXIS",
             statement_row_number=row_number,
             transaction_date=datetime(
@@ -298,12 +299,17 @@ def _source_ref(source_type, transaction_id):
     }
 
 
-def _bank_ref(filename="axis.csv", row_number=2):
+def _bank_ref(bank_transaction_id):
     return {
         "transaction_type": "bank",
-        "bank_source_filename": filename,
-        "bank_row_number": row_number,
+        "transaction_id": str(bank_transaction_id),
     }
+
+
+def _linked_bank_ref():
+    """Bank reference for a source that already carries its bank linkage."""
+
+    return {"transaction_type": "bank"}
 
 
 def _payload(primary, counterpart, company_id=COMPANY_ID, remarks=None):
@@ -329,13 +335,18 @@ def _result(session, transaction_id):
     )
 
 
-def _unmatched(session, row_number):
+def _unmatched(session, row_number, job_id=JOB):
     return session.scalar(
         select(UnmatchedBankTransaction).where(
-            UnmatchedBankTransaction.job_id == JOB,
+            UnmatchedBankTransaction.job_id == job_id,
             UnmatchedBankTransaction.statement_row_number == row_number,
         )
     )
+
+
+def _bank_id(session_factory, row_number, job_id=JOB):
+    with session_factory() as session:
+        return _unmatched(session, row_number, job_id=job_id).id
 
 
 def _summary(session):
@@ -422,11 +433,12 @@ def test_source_primary_settlement_updates_both_sides(
     session_factory,
 ):
     _fresh(session_factory)
+    bank_id = _bank_id(session_factory, 2)
 
     response = _settle(
         client,
         _source_ref("fund_request", "FR-NOT-FOUND-1"),
-        _bank_ref(row_number=2),
+        _bank_ref(bank_id),
         remarks="Reviewed by ops",
     )
 
@@ -444,6 +456,14 @@ def test_source_primary_settlement_updates_both_sides(
         "PRIMARY",
         "COUNTERPART",
     }
+
+    bank_target = next(
+        target
+        for target in payload["targets"]
+        if target["transaction_type"] == "bank"
+    )
+    assert bank_target["record_id"] == str(bank_id)
+    assert bank_target["record_key"] == "axis.csv#2"
 
     with session_factory() as session:
         source = _result(session, "FR-NOT-FOUND-1")
@@ -514,10 +534,11 @@ def test_bank_primary_settlement_requires_and_updates_source_counterpart(
     session_factory,
 ):
     _fresh(session_factory)
+    bank_id = _bank_id(session_factory, 3)
 
     response = _settle(
         client,
-        _bank_ref(row_number=3),
+        _bank_ref(bank_id),
         _source_ref("fund_request", "FR-NOT-FOUND-2"),
     )
 
@@ -543,10 +564,19 @@ def test_settlement_supports_already_linked_bank_row(
     response = _settle(
         client,
         _source_ref("va_transaction", "VA-AMBIGUOUS"),
-        _bank_ref(row_number=7),
+        _linked_bank_ref(),
     )
 
     assert response.status_code == 201, response.text
+
+    bank_target = next(
+        target
+        for target in response.json()["targets"]
+        if target["transaction_type"] == "bank"
+    )
+    assert bank_target["record_type"] == "linked_bank"
+    assert bank_target["record_id"] == "axis.csv#7"
+    assert bank_target["record_key"] == "axis.csv#7"
 
     with session_factory() as session:
         source = _result(session, "VA-AMBIGUOUS")
@@ -567,7 +597,7 @@ def test_settlement_supports_already_linked_bank_row(
             _source_ref("fund_request", "FR-NOT-FOUND-1"),
             _source_ref("va_transaction", "VA-AMBIGUOUS"),
         ),
-        (_bank_ref(), _bank_ref(row_number=3)),
+        (_bank_ref(1), _bank_ref(2)),
     ],
 )
 def test_settlement_requires_exactly_one_bank_side(
@@ -583,18 +613,33 @@ def test_settlement_requires_exactly_one_bank_side(
     assert response.status_code == 422
 
 
-def test_bank_reference_requires_composite_identity(client, session_factory):
+def test_unmatched_bank_primary_requires_transaction_id(
+    client,
+    session_factory,
+):
     _fresh(session_factory)
 
     response = client.post(
         f"/api/reconciliation/{JOB}/manual-settlements",
         json=_payload(
-            {
-                "transaction_type": "bank",
-                "bank_row_number": 2,
-            },
+            _linked_bank_ref(),
             _source_ref("fund_request", "FR-NOT-FOUND-1"),
         ),
+    )
+
+    assert response.status_code == 422
+
+
+def test_unmatched_bank_counterpart_requires_transaction_id(
+    client,
+    session_factory,
+):
+    _fresh(session_factory)
+
+    response = _settle(
+        client,
+        _source_ref("fund_request", "FR-NOT-FOUND-1"),
+        _linked_bank_ref(),
     )
 
     assert response.status_code == 422
@@ -610,11 +655,12 @@ def test_ineligible_source_status_is_rejected(
     transaction_id,
 ):
     _fresh(session_factory)
+    bank_id = _bank_id(session_factory, 2)
 
     response = _settle(
         client,
         _source_ref("fund_request", transaction_id),
-        _bank_ref(row_number=2),
+        _bank_ref(bank_id),
     )
 
     assert response.status_code == 422
@@ -623,12 +669,13 @@ def test_ineligible_source_status_is_rejected(
 
 def test_settlement_rejects_non_completed_job(client, session_factory):
     _fresh(session_factory)
+    bank_id = _bank_id(session_factory, 2)
 
     response = client.post(
         f"/api/reconciliation/{JOB_PROCESSING}/manual-settlements",
         json=_payload(
             _source_ref("fund_request", "FR-NOT-FOUND-1"),
-            _bank_ref(row_number=2),
+            _bank_ref(bank_id),
         ),
     )
 
@@ -640,58 +687,204 @@ def test_settlement_returns_404_for_unknown_records(
     session_factory,
 ):
     _fresh(session_factory)
+    bank_id = _bank_id(session_factory, 2)
 
     unknown_source = _settle(
         client,
         _source_ref("fund_request", "FR-UNKNOWN"),
-        _bank_ref(row_number=2),
+        _bank_ref(bank_id),
     )
     assert unknown_source.status_code == 404
 
     unknown_bank = _settle(
         client,
         _source_ref("fund_request", "FR-NOT-FOUND-1"),
-        _bank_ref(row_number=99),
+        _bank_ref(999999),
     )
     assert unknown_bank.status_code == 404
 
     unknown_company = _settle(
         client,
         _source_ref("fund_request", "FR-NOT-FOUND-1"),
-        _bank_ref(row_number=2),
+        _bank_ref(bank_id),
         company_id=OTHER_COMPANY_ID,
     )
     assert unknown_company.status_code == 404
 
 
-def test_source_with_different_linked_bank_rejects_counterpart(
+def test_source_with_linked_bank_rejects_unmatched_bank_reference(
     client,
     session_factory,
 ):
     _fresh(session_factory)
+    bank_id = _bank_id(session_factory, 2)
 
     response = _settle(
         client,
         _source_ref("va_transaction", "VA-AMBIGUOUS"),
-        _bank_ref(row_number=2),
+        _bank_ref(bank_id),
     )
 
     assert response.status_code == 422
 
 
-def test_bank_linked_to_another_source_rejects_counterpart(
+def test_bank_primary_rejects_source_with_linked_bank(
     client,
     session_factory,
+):
+    _fresh(session_factory)
+    bank_id = _bank_id(session_factory, 2)
+
+    response = _settle(
+        client,
+        _bank_ref(bank_id),
+        _source_ref("va_transaction", "VA-AMBIGUOUS"),
+    )
+
+    assert response.status_code == 422
+
+
+# ---------------------------------------------------------------------------
+# Unmatched bank transaction identity
+# ---------------------------------------------------------------------------
+
+
+def test_unmatched_bank_listing_exposes_bank_transaction_id(
+    client,
+    session_factory,
+):
+    _fresh(session_factory)
+    bank_two = _bank_id(session_factory, 2)
+    bank_three = _bank_id(session_factory, 3)
+
+    response = client.get(
+        f"/api/reconciliation/{JOB}/bank-transactions",
+        params={"status": "NOT_FOUND"},
+    )
+
+    assert response.status_code == 200, response.text
+    by_row = {
+        item["bank_row_number"]: item for item in response.json()["items"]
+    }
+
+    assert by_row[2]["bank_transaction_id"] == bank_two
+    assert by_row[3]["bank_transaction_id"] == bank_three
+    assert by_row[2]["bank_source_filename"] == "axis.csv"
+
+
+@pytest.mark.parametrize(
+    "transaction_id",
+    ["not-a-number", "0", "-1", ""],
+)
+def test_settlement_rejects_invalid_bank_transaction_id(
+    client,
+    session_factory,
+    transaction_id,
 ):
     _fresh(session_factory)
 
     response = _settle(
         client,
-        _source_ref("fund_request", "FR-NOT-FOUND-2"),
-        _bank_ref(row_number=7),
+        _source_ref("fund_request", "FR-NOT-FOUND-1"),
+        {
+            "transaction_type": "bank",
+            "transaction_id": transaction_id,
+        },
     )
 
     assert response.status_code == 422
+
+
+def test_settlement_rejects_bank_transaction_id_from_another_job(
+    client,
+    session_factory,
+):
+    _fresh(session_factory)
+
+    with session_factory() as session:
+        _add_unmatched_bank(
+            session,
+            row_number=2,
+            job_id=JOB_PROCESSING,
+        )
+        session.commit()
+        other_job_bank_id = _unmatched(
+            session,
+            2,
+            job_id=JOB_PROCESSING,
+        ).id
+
+    response = _settle(
+        client,
+        _source_ref("fund_request", "FR-NOT-FOUND-1"),
+        _bank_ref(other_job_bank_id),
+    )
+
+    assert response.status_code == 404
+
+
+def test_settlement_rejects_already_settled_bank_transaction_id(
+    client,
+    session_factory,
+):
+    _fresh(session_factory)
+    bank_id = _bank_id(session_factory, 2)
+
+    first = _settle(
+        client,
+        _source_ref("fund_request", "FR-NOT-FOUND-1"),
+        _bank_ref(bank_id),
+    )
+    assert first.status_code == 201, first.text
+
+    duplicate = _settle(
+        client,
+        _source_ref("fund_request", "FR-NOT-FOUND-2"),
+        _bank_ref(bank_id),
+    )
+
+    assert duplicate.status_code == 409
+    assert "active manual settlement" in duplicate.json()["detail"].lower()
+
+
+def test_successful_settlement_reports_bank_record_key(
+    client,
+    session_factory,
+):
+    _fresh(session_factory)
+    bank_id = _bank_id(session_factory, 2)
+
+    response = _settle(
+        client,
+        _source_ref("fund_request", "FR-NOT-FOUND-1"),
+        _bank_ref(bank_id),
+    )
+
+    assert response.status_code == 201, response.text
+    payload = response.json()
+
+    assert payload["counterpart"]["transaction_type"] == "bank"
+    assert payload["counterpart"]["record_key"] == "axis.csv#2"
+    assert payload["primary"]["record_key"] == "FR-NOT-FOUND-1"
+
+
+def test_settlement_accepts_numeric_bank_transaction_id(
+    client,
+    session_factory,
+):
+    _fresh(session_factory)
+    bank_id = _bank_id(session_factory, 2)
+
+    response = _settle(
+        client,
+        _source_ref("fund_request", "FR-NOT-FOUND-1"),
+        {
+            "transaction_type": "bank",
+            "transaction_id": bank_id,
+        },
+    )
+
+    assert response.status_code == 201, response.text
 
 
 # ---------------------------------------------------------------------------
@@ -705,6 +898,7 @@ def test_settlement_rolls_back_when_a_later_step_fails(
     monkeypatch,
 ):
     _fresh(session_factory)
+    bank_id = _bank_id(session_factory, 2)
 
     def fail(*args, **kwargs):
         raise RuntimeError("forced failure")
@@ -718,7 +912,7 @@ def test_settlement_rolls_back_when_a_later_step_fails(
         _settle(
             client,
             _source_ref("fund_request", "FR-NOT-FOUND-1"),
-            _bank_ref(row_number=2),
+            _bank_ref(bank_id),
         )
 
     with session_factory() as session:
@@ -737,25 +931,27 @@ def test_duplicate_active_settlement_is_prevented(
     session_factory,
 ):
     _fresh(session_factory)
+    bank_two = _bank_id(session_factory, 2)
+    bank_three = _bank_id(session_factory, 3)
 
     first = _settle(
         client,
         _source_ref("fund_request", "FR-NOT-FOUND-1"),
-        _bank_ref(row_number=2),
+        _bank_ref(bank_two),
     )
     assert first.status_code == 201, first.text
 
     duplicate_source = _settle(
         client,
         _source_ref("fund_request", "FR-NOT-FOUND-1"),
-        _bank_ref(row_number=3),
+        _bank_ref(bank_three),
     )
     assert duplicate_source.status_code == 409
 
     duplicate_bank = _settle(
         client,
         _source_ref("fund_request", "FR-NOT-FOUND-2"),
-        _bank_ref(row_number=2),
+        _bank_ref(bank_two),
     )
     assert duplicate_bank.status_code == 409
 
@@ -770,11 +966,12 @@ def test_reversal_restores_both_records_and_summary(
     session_factory,
 ):
     _fresh(session_factory)
+    bank_id = _bank_id(session_factory, 2)
 
     settled = _settle(
         client,
         _source_ref("fund_request", "FR-NOT-FOUND-1"),
-        _bank_ref(row_number=2),
+        _bank_ref(bank_id),
         remarks="Reviewed",
     )
     settlement_id = settled.json()["settlement_id"]
@@ -810,6 +1007,15 @@ def test_reversal_restores_both_records_and_summary(
         assert settlement.status == "REVERSED"
         assert all(target.active is False for target in settlement.targets)
 
+        bank_target = next(
+            target
+            for target in settlement.targets
+            if target.transaction_type == "bank"
+        )
+        assert bank_target.record_id == str(bank_id)
+        assert bank_target.record_key == "axis.csv#2"
+        assert bank_target.unmatched_bank_id == bank_id
+
     summary_after_reverse = client.get(
         f"/api/reconciliation/{JOB}/summary"
     ).json()["summary"]
@@ -834,7 +1040,7 @@ def test_reversal_restores_both_records_and_summary(
     resettled = _settle(
         client,
         _source_ref("fund_request", "FR-NOT-FOUND-1"),
-        _bank_ref(row_number=2),
+        _bank_ref(bank_id),
     )
     assert resettled.status_code == 201, resettled.text
     assert resettled.json()["settlement_id"] != settlement_id
@@ -845,11 +1051,13 @@ def test_settlement_history_is_listed_and_preserved(
     session_factory,
 ):
     _fresh(session_factory)
+    bank_two = _bank_id(session_factory, 2)
+    bank_three = _bank_id(session_factory, 3)
 
     first = _settle(
         client,
         _source_ref("fund_request", "FR-NOT-FOUND-1"),
-        _bank_ref(row_number=2),
+        _bank_ref(bank_two),
     )
     first_id = first.json()["settlement_id"]
 
@@ -861,7 +1069,7 @@ def test_settlement_history_is_listed_and_preserved(
     second = _settle(
         client,
         _source_ref("fund_request", "FR-NOT-FOUND-2"),
-        _bank_ref(row_number=3),
+        _bank_ref(bank_three),
     )
     assert second.status_code == 201, second.text
 
@@ -893,11 +1101,12 @@ def _csv_rows(response):
 
 def test_exports_reflect_settlement(client, session_factory):
     _fresh(session_factory)
+    bank_id = _bank_id(session_factory, 2)
 
     settled = _settle(
         client,
         _source_ref("fund_request", "FR-NOT-FOUND-1"),
-        _bank_ref(row_number=2),
+        _bank_ref(bank_id),
     )
     assert settled.status_code == 201, settled.text
 
@@ -943,6 +1152,7 @@ def test_exports_reflect_settlement(client, session_factory):
 
 def test_summary_counts_update_after_settlement(client, session_factory):
     _fresh(session_factory)
+    bank_id = _bank_id(session_factory, 2)
 
     before = client.get(f"/api/reconciliation/{JOB}/summary").json()["summary"]
     assert before["overall"]["total_source_records"] == 5
@@ -955,7 +1165,7 @@ def test_summary_counts_update_after_settlement(client, session_factory):
     response = _settle(
         client,
         _source_ref("fund_request", "FR-NOT-FOUND-1"),
-        _bank_ref(row_number=2),
+        _bank_ref(bank_id),
     )
     assert response.status_code == 201, response.text
 

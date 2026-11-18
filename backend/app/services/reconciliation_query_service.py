@@ -815,6 +815,7 @@ def serialize_unmatched_bank(
     """
 
     return {
+        "bank_transaction_id": row.id,
         "source_type": None,
         "source_transaction_id": None,
         "source_row_number": None,
