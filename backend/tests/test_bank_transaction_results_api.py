@@ -8,7 +8,7 @@ from decimal import Decimal
 import pytest
 
 from fastapi.testclient import TestClient
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, func, select
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.ext.compiler import compiles
 from sqlalchemy.orm import sessionmaker
@@ -16,8 +16,12 @@ from sqlalchemy.pool import StaticPool
 
 from app.database.base import Base
 from app.db_models import (
+    Company,
+    ManualSettlement,
+    ManualSettlementTarget,
     ReconciliationJob,
     ReconciliationResult,
+    ReconciliationSummary,
     UnmatchedBankTransaction,
 )
 from app.main import app
@@ -42,6 +46,7 @@ JOB_BANK = uuid.UUID("11111111-1111-1111-1111-111111111111")
 JOB_PAGINATION = uuid.UUID("22222222-2222-2222-2222-222222222222")
 JOB_EMPTY = uuid.UUID("33333333-3333-3333-3333-333333333333")
 JOB_PROCESSING = uuid.UUID("44444444-4444-4444-4444-444444444444")
+JOB_OTHER = uuid.UUID("55555555-5555-5555-5555-555555555555")
 
 
 @pytest.fixture()
@@ -57,6 +62,10 @@ def session_factory():
             ReconciliationJob.__table__,
             ReconciliationResult.__table__,
             UnmatchedBankTransaction.__table__,
+            ReconciliationSummary.__table__,
+            Company.__table__,
+            ManualSettlement.__table__,
+            ManualSettlementTarget.__table__,
         ],
     )
 
@@ -994,3 +1003,261 @@ def test_existing_fund_request_and_va_apis_still_work(
         item["source_transaction_id"]
         for item in va_matched.json()["items"]
     } == {"VA-BANK-1", "VA-BANK-DUPLICATE"}
+
+
+def _unmatched_id(session, job_id, utr):
+    return session.scalar(
+        select(UnmatchedBankTransaction.id).where(
+            UnmatchedBankTransaction.job_id == job_id,
+            UnmatchedBankTransaction.utr == utr,
+        )
+    )
+
+
+def _delete_bank_transaction(client, job_id, bank_transaction_id):
+    return client.delete(
+        f"/api/reconciliation/{job_id}/bank-transactions/"
+        f"{bank_transaction_id}"
+    )
+
+
+def test_delete_unmatched_bank_transaction_removes_only_target(
+    client,
+    session_factory,
+):
+    with session_factory() as session:
+        _seed_bank_job(session)
+        target_id = _unmatched_id(session, JOB_BANK, "UTRUNMATCHED10")
+        other_id = _unmatched_id(session, JOB_BANK, "UTRUNMATCHED11")
+        matched_before = session.scalar(
+            select(func.count())
+            .select_from(ReconciliationResult)
+            .where(ReconciliationResult.job_id == JOB_BANK)
+        )
+
+    response = _delete_bank_transaction(client, JOB_BANK, target_id)
+
+    assert response.status_code == 200, response.text
+    assert response.json() == {
+        "job_id": str(JOB_BANK),
+        "bank_transaction_id": target_id,
+        "deleted": True,
+    }
+
+    with session_factory() as session:
+        assert session.get(UnmatchedBankTransaction, target_id) is None
+        assert session.get(UnmatchedBankTransaction, other_id) is not None
+        assert (
+            session.scalar(
+                select(func.count())
+                .select_from(ReconciliationResult)
+                .where(ReconciliationResult.job_id == JOB_BANK)
+            )
+            == matched_before
+        )
+
+        summary = session.get(ReconciliationSummary, JOB_BANK)
+        assert summary is not None
+        assert summary.unmatched_bank_count == 1
+
+    listing = client.get(
+        f"/api/reconciliation/{JOB_BANK}/bank-transactions",
+        params={"status": "NOT_FOUND"},
+    )
+
+    assert listing.status_code == 200, listing.text
+    payload = listing.json()
+    assert payload["total"] == 1
+    assert [item["bank_transaction_id"] for item in payload["items"]] == [
+        other_id
+    ]
+    assert payload["items"][0]["bank_utr"] == "UTRUNMATCHED11"
+
+    matched = client.get(
+        f"/api/reconciliation/{JOB_BANK}/bank-transactions",
+        params={"status": "MATCHED"},
+    )
+    assert matched.status_code == 200, matched.text
+    assert matched.json()["total"] == 2
+
+
+def test_delete_unknown_bank_transaction_returns_404(
+    client,
+    session_factory,
+):
+    with session_factory() as session:
+        _seed_bank_job(session)
+
+    response = _delete_bank_transaction(client, JOB_BANK, 999999)
+
+    assert response.status_code == 404
+    assert "999999" in response.json()["detail"]
+
+    listing = client.get(
+        f"/api/reconciliation/{JOB_BANK}/bank-transactions",
+        params={"status": "NOT_FOUND"},
+    )
+    assert listing.json()["total"] == 2
+
+
+def test_delete_bank_transaction_from_another_job_returns_404(
+    client,
+    session_factory,
+):
+    with session_factory() as session:
+        _seed_bank_job(session)
+        _add_job(session, JOB_OTHER)
+        _add_unmatched_bank(
+            session,
+            JOB_OTHER,
+            row_number=20,
+            utr="UTRUNMATCHED-OTHER",
+        )
+        session.commit()
+        other_id = _unmatched_id(session, JOB_OTHER, "UTRUNMATCHED-OTHER")
+
+    response = _delete_bank_transaction(client, JOB_BANK, other_id)
+
+    assert response.status_code == 404
+
+    with session_factory() as session:
+        assert session.get(UnmatchedBankTransaction, other_id) is not None
+
+    other_listing = client.get(
+        f"/api/reconciliation/{JOB_OTHER}/bank-transactions",
+        params={"status": "NOT_FOUND"},
+    )
+    assert other_listing.json()["total"] == 1
+
+
+@pytest.mark.parametrize("bank_transaction_id", ["abc", 0, -1, 1.5])
+def test_delete_bank_transaction_invalid_id_returns_422(
+    client,
+    bank_transaction_id,
+):
+    response = _delete_bank_transaction(
+        client,
+        JOB_BANK,
+        bank_transaction_id,
+    )
+
+    assert response.status_code == 422
+
+
+def test_delete_bank_transaction_unknown_job_returns_404(client):
+    response = _delete_bank_transaction(client, uuid.uuid4(), 1)
+
+    assert response.status_code == 404
+
+
+def test_delete_bank_transaction_processing_job_returns_409(
+    client,
+    session_factory,
+):
+    with session_factory() as session:
+        _add_job(session, JOB_PROCESSING, status="PROCESSING")
+        session.commit()
+
+    response = _delete_bank_transaction(client, JOB_PROCESSING, 1)
+
+    assert response.status_code == 409
+    assert "not completed" in response.json()["detail"]
+
+
+def test_delete_settled_bank_transaction_returns_409(
+    client,
+    session_factory,
+):
+    with session_factory() as session:
+        _seed_bank_job(session)
+        target_id = _unmatched_id(session, JOB_BANK, "UTRUNMATCHED10")
+        row = session.get(UnmatchedBankTransaction, target_id)
+        row.active_settlement_id = uuid.uuid4()
+        session.commit()
+
+    response = _delete_bank_transaction(client, JOB_BANK, target_id)
+
+    assert response.status_code == 409
+    assert "settled" in response.json()["detail"]
+
+    with session_factory() as session:
+        assert session.get(UnmatchedBankTransaction, target_id) is not None
+
+
+def test_delete_bank_transaction_with_settlement_history_returns_409(
+    client,
+    session_factory,
+):
+    with session_factory() as session:
+        _seed_bank_job(session)
+        target_id = _unmatched_id(session, JOB_BANK, "UTRUNMATCHED10")
+        session.add(
+            ManualSettlementTarget(
+                settlement_id=uuid.uuid4(),
+                job_id=JOB_BANK,
+                role="PRIMARY",
+                transaction_type="bank",
+                record_type="unmatched_bank",
+                record_id=f"unmatched-bank.csv#{target_id}",
+                record_key=f"unmatched-bank.csv#{target_id}",
+                unmatched_bank_id=target_id,
+                active=False,
+            )
+        )
+        session.commit()
+
+    response = _delete_bank_transaction(client, JOB_BANK, target_id)
+
+    assert response.status_code == 409
+    assert "linked" in response.json()["detail"]
+
+    with session_factory() as session:
+        assert session.get(UnmatchedBankTransaction, target_id) is not None
+
+
+def test_delete_bank_transaction_linked_to_result_returns_409(
+    client,
+    session_factory,
+):
+    with session_factory() as session:
+        _add_job(session, JOB_OTHER)
+        _add_unmatched_bank(
+            session,
+            JOB_OTHER,
+            row_number=20,
+            utr="UTRLINKED",
+        )
+        _add_result(
+            session,
+            JOB_OTHER,
+            source_type="fund_request",
+            final_status="MATCHED",
+            source_transaction_id="FR-LINKED-BANK",
+            bank_row_number=20,
+            bank_source_filename="unmatched-bank.csv",
+        )
+        session.commit()
+        target_id = _unmatched_id(session, JOB_OTHER, "UTRLINKED")
+
+    response = _delete_bank_transaction(client, JOB_OTHER, target_id)
+
+    assert response.status_code == 409
+    assert "linked" in response.json()["detail"]
+
+    with session_factory() as session:
+        assert session.get(UnmatchedBankTransaction, target_id) is not None
+
+
+def test_delete_bank_transaction_twice_returns_404_on_repeat(
+    client,
+    session_factory,
+):
+    with session_factory() as session:
+        _seed_bank_job(session)
+        target_id = _unmatched_id(session, JOB_BANK, "UTRUNMATCHED10")
+
+    first = _delete_bank_transaction(client, JOB_BANK, target_id)
+    second = _delete_bank_transaction(client, JOB_BANK, target_id)
+
+    assert first.status_code == 200, first.text
+    assert second.status_code == 404
