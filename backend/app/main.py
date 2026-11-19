@@ -56,6 +56,11 @@ from app.core.pagination import (
     LimitParam,
     PageParam,
 )
+from app.core.search_params import (
+    AmountFilterParam,
+    BankRowNumberFilterParam,
+    TextFilterParam,
+)
 from app.core.security import (
     verify_password,
     create_access_token,
@@ -115,6 +120,7 @@ from app.services.manual_settlement_service import (
 from app.services.reconciliation_query_service import (
     COMPLETED_JOB_STATUS,
     FRONTEND_STATUS_MAP,
+    ResultSearchFilters,
     count_fund_request_results,
     count_matched_bank_transactions,
     count_unmatched_bank_transactions,
@@ -1001,6 +1007,12 @@ FundRequestStatus = Literal["MATCHED", "NOT_FOUND"]
 def get_fund_request_results(
     job_id: uuid.UUID,
     status: FundRequestStatus = Query(...),
+    search: TextFilterParam = None,
+    reference: TextFilterParam = None,
+    amount: AmountFilterParam = None,
+    name: TextFilterParam = None,
+    bank: TextFilterParam = None,
+    bank_row_number: BankRowNumberFilterParam = None,
     page: PageParam = DEFAULT_PAGE,
     limit: LimitParam = DEFAULT_LIMIT,
     session: Session = Depends(get_db_session),
@@ -1033,7 +1045,20 @@ def get_fund_request_results(
         )
 
     internal_status = FRONTEND_STATUS_MAP[status]
-    total = count_fund_request_results(session, job_id, internal_status)
+    filters = ResultSearchFilters(
+        reference=reference,
+        amount=amount,
+        name=name,
+        bank=bank,
+        bank_row_number=bank_row_number,
+        search=search,
+    )
+    total = count_fund_request_results(
+        session,
+        job_id,
+        internal_status,
+        filters,
+    )
 
     offset = (page - 1) * limit
 
@@ -1041,6 +1066,7 @@ def get_fund_request_results(
         session,
         job_id,
         internal_status,
+        search=filters,
         offset=offset,
         limit=limit,
     )
@@ -1067,6 +1093,12 @@ VATransactionStatus = Literal["MATCHED", "NOT_FOUND"]
 def get_va_transaction_results(
     job_id: uuid.UUID,
     status: VATransactionStatus = Query(...),
+    search: TextFilterParam = None,
+    reference: TextFilterParam = None,
+    amount: AmountFilterParam = None,
+    name: TextFilterParam = None,
+    bank: TextFilterParam = None,
+    bank_row_number: BankRowNumberFilterParam = None,
     page: PageParam = DEFAULT_PAGE,
     limit: LimitParam = DEFAULT_LIMIT,
     session: Session = Depends(get_db_session),
@@ -1099,8 +1131,21 @@ def get_va_transaction_results(
         )
 
     internal_status = FRONTEND_STATUS_MAP[status]
+    filters = ResultSearchFilters(
+        reference=reference,
+        amount=amount,
+        name=name,
+        bank=bank,
+        bank_row_number=bank_row_number,
+        search=search,
+    )
 
-    total = count_va_transaction_results(session, job_id, internal_status)
+    total = count_va_transaction_results(
+        session,
+        job_id,
+        internal_status,
+        filters,
+    )
 
     offset = (page - 1) * limit
 
@@ -1108,6 +1153,7 @@ def get_va_transaction_results(
         session,
         job_id,
         internal_status,
+        search=filters,
         offset=offset,
         limit=limit,
     )
@@ -1134,6 +1180,12 @@ BankTransactionStatus = Literal["MATCHED", "NOT_FOUND"]
 def get_bank_transaction_results(
     job_id: uuid.UUID,
     status: BankTransactionStatus = Query(...),
+    search: TextFilterParam = None,
+    reference: TextFilterParam = None,
+    amount: AmountFilterParam = None,
+    name: TextFilterParam = None,
+    bank: TextFilterParam = None,
+    bank_row_number: BankRowNumberFilterParam = None,
     page: PageParam = DEFAULT_PAGE,
     limit: LimitParam = DEFAULT_LIMIT,
     session: Session = Depends(get_db_session),
@@ -1166,21 +1218,39 @@ def get_bank_transaction_results(
         )
 
     offset = (page - 1) * limit
+    filters = ResultSearchFilters(
+        reference=reference,
+        amount=amount,
+        name=name,
+        bank=bank,
+        bank_row_number=bank_row_number,
+        search=search,
+    )
 
     if status == "MATCHED":
-        total = count_matched_bank_transactions(session, job_id)
+        total = count_matched_bank_transactions(
+            session,
+            job_id,
+            filters,
+        )
         rows = list_matched_bank_transactions(
             session,
             job_id,
+            search=filters,
             offset=offset,
             limit=limit,
         )
         items = [serialize_result(row) for row in rows]
     else:
-        total = count_unmatched_bank_transactions(session, job_id)
+        total = count_unmatched_bank_transactions(
+            session,
+            job_id,
+            filters,
+        )
         rows = list_unmatched_bank_transactions(
             session,
             job_id,
+            search=filters,
             offset=offset,
             limit=limit,
         )
