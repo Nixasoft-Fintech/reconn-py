@@ -16,6 +16,7 @@ from fastapi import (
     File,
     Form,
     HTTPException,
+    Path as PathParam,
     Query,
     UploadFile,
 )
@@ -59,6 +60,9 @@ from app.schemas.company import CompanyCreate
 from app.schemas.manual_settlement import (
     ManualSettlementCreate,
     ManualSettlementReversal,
+)
+from app.services.bank_transaction_service import (
+    delete_unmatched_bank_transaction,
 )
 from app.services.company_service import (
     create_company,
@@ -1091,6 +1095,37 @@ def get_bank_transaction_results(
         "has_next": page < total_pages,
         "has_previous": page > 1,
         "items": items,
+    }
+
+
+@app.delete(
+    "/api/reconciliation/{job_id}/bank-transactions/{bank_transaction_id}"
+)
+def delete_bank_transaction_result(
+    job_id: uuid.UUID,
+    bank_transaction_id: int = PathParam(..., ge=1),
+    session: Session = Depends(get_db_session),
+) -> dict[str, Any]:
+    """Permanently delete one unmatched bank statement row.
+
+    Only the persisted ``UnmatchedBankTransaction`` row is removed.  The
+    original uploaded bank statement file and every reconciliation result are
+    left untouched.  Settled or linked rows are rejected.
+    """
+
+    try:
+        delete_unmatched_bank_transaction(
+            session,
+            job_id,
+            bank_transaction_id,
+        )
+    except ServiceError as exc:
+        _raise_service_error(exc)
+
+    return {
+        "job_id": str(job_id),
+        "bank_transaction_id": bank_transaction_id,
+        "deleted": True,
     }
 
 

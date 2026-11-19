@@ -830,6 +830,7 @@ def serialize_unmatched_bank(
         "source_virtual_account_number": None,
         "source_data": None,
         "bank_row_number": row.statement_row_number,
+        "bank_transaction_id": row.id,
         "bank_name": row.bank_name,
         "bank_utr": row.utr,
         "bank_reference": row.reference,
