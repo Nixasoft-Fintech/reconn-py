@@ -50,6 +50,14 @@ def classify_failure(exc: Exception) -> str:
             return "DATABASE_CONNECTION_ERROR"
 
         original_error = exc.orig
+
+
+        sqlstate = getattr(original_error, "sqlstate", None)
+
+        print("DATABASE EXCEPTION:", repr(original_error))
+        print("DATABASE SQLSTATE:", sqlstate)
+        print("CONNECTION INVALIDATED:", exc.connection_invalidated)
+
         sqlstate = getattr(original_error, "sqlstate", None)
 
         # PostgreSQL connection-related SQLSTATE codes.

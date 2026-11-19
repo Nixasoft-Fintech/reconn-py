@@ -7,6 +7,7 @@ from app.db_models.manual_settlement import (
     ManualSettlement,
     ManualSettlementTarget,
 )
+from app.db_models.user import User
 
 __all__ = [
     "ReconciliationJob",
@@ -16,4 +17,5 @@ __all__ = [
     "Company",
     "ManualSettlement",
     "ManualSettlementTarget",
+    "User",
 ]

@@ -24,6 +24,8 @@ from app.db_models import (
 from app.models.reconciliation import ReconciliationOutput
 import logging
 from app.services.failure_classifier import classify_failure
+import sqlalchemy as sa
+from sqlalchemy.dialects import postgresql
 
 retry_outputs = {}
 _job_locks = {}
@@ -316,6 +318,7 @@ def _build_unmatched_bank_record(
 
 def create_pending_job(
     *,
+    user_id: uuid.UUID,
     fund_request_filename: str | None,
     va_transaction_filename: str | None,
     bank_files: list[dict[str, Any]],
@@ -332,6 +335,7 @@ def create_pending_job(
     with SessionLocal.begin() as session:
         job = ReconciliationJob(
             job_id=job_id,
+            user_id=user_id,
             status="PENDING",
             fund_request_filename=fund_request_filename,
             va_transaction_filename=va_transaction_filename,
@@ -397,7 +401,6 @@ def _save_batch_with_retry(model, records, conflict_columns, conflict_condition)
 
     for attempt in range(1, 4):
         try:
-            # A fresh session and transaction for every attempt.
             with SessionLocal.begin() as session:
                 session.execute(statement)
 

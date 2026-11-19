@@ -6,6 +6,8 @@ from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.database.base import Base
+from sqlalchemy import ForeignKey
+from sqlalchemy.dialects.postgresql import JSONB
 
 
 class ReconciliationJob(Base):
@@ -15,6 +17,18 @@ class ReconciliationJob(Base):
         Uuid(as_uuid=True),
         primary_key=True,
         default=uuid.uuid4,
+    )
+
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+
+    user = relationship(
+        "User",
+        back_populates="reconciliation_jobs",
     )
 
     status: Mapped[str] = mapped_column(
@@ -29,9 +43,9 @@ class ReconciliationJob(Base):
     )
 
     failure_code: Mapped[str | None] = mapped_column(
-    String(50),
-    nullable=True,
-)
+        String(50),
+        nullable=True,
+    )
 
     fund_request_filename: Mapped[str | None] = mapped_column(
         String(255),

@@ -230,9 +230,7 @@ def count_matched_bank_transactions(
 
     ranked = _matched_bank_row_ranking(job_id)
     statement = (
-        select(func.count())
-        .select_from(ranked)
-        .where(ranked.c.bank_row_rank == 1)
+        select(func.count()).select_from(ranked).where(ranked.c.bank_row_rank == 1)
     )
 
     return int(session.scalar(statement) or 0)
@@ -366,9 +364,7 @@ def _aggregate_source_status_counts(
 
     counts: dict[uuid.UUID, dict[str, dict[str, int]]] = {}
 
-    for job_id, source_type, final_status, record_count in session.execute(
-        statement
-    ):
+    for job_id, source_type, final_status, record_count in session.execute(statement):
         source_counts = counts.setdefault(job_id, {})
         status_counts = source_counts.setdefault(source_type, {})
         status_counts[final_status] = int(record_count)
@@ -458,8 +454,7 @@ def _aggregate_unmatched_bank_counts(
     )
 
     return {
-        job_id: int(record_count)
-        for job_id, record_count in session.execute(statement)
+        job_id: int(record_count) for job_id, record_count in session.execute(statement)
     }
 
 
@@ -536,9 +531,7 @@ def _serialize_history_job(
         "job_id": str(job.job_id),
         "status": job.status,
         "created_at": (job.created_at.isoformat() if job.created_at else None),
-        "completed_at": (
-            job.completed_at.isoformat() if job.completed_at else None
-        ),
+        "completed_at": (job.completed_at.isoformat() if job.completed_at else None),
         "processing_duration_seconds": _history_processing_duration(job),
         "fund_request_filename": job.fund_request_filename,
         "va_transaction_filename": job.va_transaction_filename,
@@ -587,28 +580,24 @@ def list_reconciliation_history(
     page: int = 1,
     limit: int = 100,
     status: str | None = None,
+    user_id: uuid.UUID | None = None,
 ) -> tuple[int, list[dict[str, Any]]]:
-    """Return persisted reconciliation jobs, newest first.
-
-    Pagination and optional status filtering are applied before the aggregate
-    count queries, so only jobs on the requested page are summarized.  No
-    reconciliation work is performed and no rows are written.
-    """
+    """Return persisted reconciliation jobs, newest first."""
 
     filters = []
 
     normalized_status = _normalize_history_status_filter(status)
 
     if normalized_status:
-        filters.append(
-            func.upper(ReconciliationJob.status) == normalized_status
-        )
+        filters.append(func.upper(ReconciliationJob.status) == normalized_status)
+
+    # Apply ownership filtering for non-admin users.
+    if user_id is not None:
+        filters.append(ReconciliationJob.user_id == user_id)
 
     total = int(
         session.scalar(
-            select(func.count())
-            .select_from(ReconciliationJob)
-            .where(*filters)
+            select(func.count()).select_from(ReconciliationJob).where(*filters)
         )
         or 0
     )
@@ -617,6 +606,7 @@ def list_reconciliation_history(
         return 0, []
 
     offset = (page - 1) * limit
+
     statement = (
         select(ReconciliationJob)
         .where(*filters)
@@ -627,6 +617,7 @@ def list_reconciliation_history(
         .offset(offset)
         .limit(limit)
     )
+
     jobs = list(session.scalars(statement))
 
     return total, _serialize_history_jobs(session, jobs)

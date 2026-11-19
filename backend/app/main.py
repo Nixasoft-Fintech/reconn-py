@@ -1,27 +1,36 @@
 from __future__ import annotations
 
-from fileinput import filename
 import json
+import logging
 import re
-
 import tempfile
 import uuid
+
+from contextlib import asynccontextmanager
 from pathlib import Path
+from time import perf_counter, sleep
 from typing import Any, Literal
 
 from fastapi import (
     BackgroundTasks,
+    Cookie,
     Depends,
     FastAPI,
     File,
     Form,
     HTTPException,
     Query,
+    Response,
     UploadFile,
+    status,
 )
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
+
+from sqlalchemy import select
 from sqlalchemy.orm import Session
+
+from jwt import InvalidTokenError
 
 from app.adapters.base import AdapterError
 from app.adapters.bank_statement_adapter import (
@@ -32,6 +41,7 @@ from app.adapters.bank_statement_adapter import (
 )
 from app.adapters.fund_request_adapter import FundRequestAdapter
 from app.adapters.va_transaction_adapter import VATransactionAdapter
+
 from app.core.file_reader import (
     FileReadError,
     SUPPORTED_EXTENSIONS,
@@ -39,8 +49,37 @@ from app.core.file_reader import (
     read_bank_statement_file,
 )
 from app.core.inspection import inspect_report
-from app.core.pagination import DEFAULT_LIMIT, DEFAULT_PAGE, LimitParam, PageParam
+from app.core.pagination import (
+    DEFAULT_LIMIT,
+    DEFAULT_PAGE,
+    LimitParam,
+    PageParam,
+)
+from app.core.security import (
+    verify_password,
+    create_access_token,
+    create_refresh_token,
+    hash_refresh_token,
+    decode_refresh_token,
+)
+from app.core.config import settings
+
+from app.database.connection import SessionLocal, get_db
+
+from app.db_models.reconciliation_job import ReconciliationJob
+from app.db_models.reconciliation_summary import ReconciliationSummary
+from app.db_models.user import User
+
 from app.matching.engine import MatchingConfig, reconcile_transactions
+
+from app.schemas.auth import LoginRequest, LoginResponse
+from app.schemas.company import CompanyCreate
+from app.schemas.manual_settlement import (
+    ManualSettlementCreate,
+    ManualSettlementReversal,
+)
+from app.db_models.manual_settlement import ManualSettlement
+
 from app.services.csv_export_service import (
     bank_matched_csv,
     bank_unmatched_csv,
@@ -55,11 +94,6 @@ from app.services.persistence_service import (
     save_reconciliation,
     retry_outputs,
 )
-from app.schemas.company import CompanyCreate
-from app.schemas.manual_settlement import (
-    ManualSettlementCreate,
-    ManualSettlementReversal,
-)
 from app.services.company_service import (
     create_company,
     get_company,
@@ -73,9 +107,6 @@ from app.services.manual_settlement_service import (
     reverse_manual_settlement,
     serialize_settlement,
 )
-from sqlalchemy import select
-from app.db_models.reconciliation_job import ReconciliationJob
-from app.db_models.reconciliation_summary import ReconciliationSummary
 from app.services.reconciliation_query_service import (
     COMPLETED_JOB_STATUS,
     FRONTEND_STATUS_MAP,
@@ -94,11 +125,8 @@ from app.services.reconciliation_query_service import (
     serialize_result,
     serialize_unmatched_bank,
 )
-from time import perf_counter, sleep
 from app.services.failure_classifier import get_failure_message
-from contextlib import asynccontextmanager
-from app.database.connection import SessionLocal
-import logging
+from app.core.dependencies import get_current_user, require_admin
 
 APP_TITLE = "Bank Statement Reconciliation API"
 MAX_UPLOAD_BYTES = 50 * 1024 * 1024
@@ -247,64 +275,10 @@ async def health() -> dict[str, str]:
     return {"status": "ok", "service": APP_TITLE}
 
 
-@app.post("/api/inspect-reports")
-async def inspect_reports(
-    fund_request_file: UploadFile = File(...),
-    va_transaction_file: UploadFile = File(...),
-) -> dict[str, Any]:
-    with tempfile.TemporaryDirectory(prefix="bank-recon-inspect-") as temp_dir:
-        folder = Path(temp_dir)
-        try:
-            fund_path = await _save_upload(fund_request_file, folder)
-            va_path = await _save_upload(va_transaction_file, folder)
-            fund_frame, fund_transactions = FundRequestAdapter().read(str(fund_path))
-            va_frame, va_transactions = VATransactionAdapter().read(str(va_path))
-        except (FileReadError, AdapterError) as exc:
-            raise HTTPException(status_code=422, detail=str(exc)) from exc
-
-        return {
-            "fund_request": {
-                "file_name": _safe_filename(fund_request_file.filename),
-                "report_type": "fund_request",
-                "inspection": inspect_report(fund_frame, fund_transactions),
-            },
-            "va_transaction": {
-                "file_name": _safe_filename(va_transaction_file.filename),
-                "report_type": "va_transaction",
-                "inspection": inspect_report(va_frame, va_transactions),
-            },
-        }
-
-
-@app.post("/api/inspect-bank-statement")
-async def inspect_bank_statement(
-    bank_statement_file: UploadFile = File(...),
-) -> dict[str, Any]:
-    with tempfile.TemporaryDirectory(prefix="bank-recon-bank-inspect-") as temp_dir:
-        folder = Path(temp_dir)
-        try:
-            bank_path = await _save_upload(bank_statement_file, folder)
-            frame = read_tabular_file(bank_path)
-        except FileReadError as exc:
-            raise HTTPException(status_code=422, detail=str(exc)) from exc
-
-        columns = [str(column) for column in frame.columns]
-        return {
-            "file_name": _safe_filename(bank_statement_file.filename),
-            "record_count": int(len(frame)),
-            "columns": columns,
-            "sample_rows": _json_sample(frame),
-            "possible_column_matches": _suggest_column_candidates(columns),
-            "notice": (
-                "These are column-name suggestions only. Confirm mappings and transaction "
-                "direction against the real bank statement before reconciliation."
-            ),
-        }
-
-
 @app.post("/api/reconcile")
 async def reconcile(
     background_tasks: BackgroundTasks,
+    current_user: User = Depends(get_current_user),
     bank_statement_file: list[UploadFile] = File(...),
     fund_request_file: UploadFile = File(...),
     va_transaction_file: UploadFile = File(...),
@@ -473,6 +447,7 @@ async def reconcile(
 
         # Create the job before starting background persistence.
         job_id = create_pending_job(
+            user_id=current_user.id,
             fund_request_filename=_safe_filename(fund_request_file.filename),
             va_transaction_filename=_safe_filename(va_transaction_file.filename),
             bank_files=bank_files_processed,
@@ -509,14 +484,23 @@ async def reconcile(
 @app.post("/api/reconciliation/{job_id}/retry")
 def retry_reconciliation_persistence(
     job_id: uuid.UUID,
+    current_user: User = Depends(get_current_user),
 ) -> dict[str, Any]:
     """Retry persistence using the original in-memory reconciliation output."""
 
-    # Check whether the job exists.
+    # Check whether the job exists and whether the user can access it.
     with SessionLocal() as session:
         job = session.get(ReconciliationJob, job_id)
 
         if job is None:
+            raise HTTPException(
+                status_code=404,
+                detail="Reconciliation job not found.",
+            )
+
+        # Customers can retry only their own jobs.
+        # Admins can retry jobs belonging to any user.
+        if current_user.role != "admin" and job.user_id != current_user.id:
             raise HTTPException(
                 status_code=404,
                 detail="Reconciliation job not found.",
@@ -570,11 +554,32 @@ def retry_reconciliation_persistence(
 
 
 @app.get("/api/reconciliation/{job_id}/events")
-def reconciliation_status_events(job_id: uuid.UUID):
+def reconciliation_status_events(
+    job_id: uuid.UUID,
+    current_user: User = Depends(get_current_user),
+):
     """
     Stream reconciliation job status changes using Server-Sent Events.
     The connection closes when the job reaches COMPLETED or FAILED.
     """
+
+    # Check whether the job exists and whether the user can access it.
+    with SessionLocal() as session:
+        job = session.get(ReconciliationJob, job_id)
+
+        if job is None:
+            raise HTTPException(
+                status_code=404,
+                detail="Reconciliation job not found.",
+            )
+
+        # Admins can access all jobs.
+        # Customers can access only their own jobs.
+        if current_user.role != "admin" and job.user_id != current_user.id:
+            raise HTTPException(
+                status_code=404,
+                detail="Reconciliation job not found.",
+            )
 
     def event_stream():
         last_status = None
@@ -669,20 +674,18 @@ def get_reconciliation_history(
     page: PageParam = DEFAULT_PAGE,
     limit: LimitParam = DEFAULT_LIMIT,
     session: Session = Depends(get_db_session),
+    current_user: User = Depends(get_current_user),
 ) -> dict[str, Any]:
-    """Return persisted reconciliation jobs, newest first.
-
-    The optional status filter is matched against the persisted job status.
-    A blank value is treated as omitted, matching the shared pagination
-    parameter convention.  No reconciliation is executed.
-    """
+    """Return persisted reconciliation jobs, newest first."""
 
     total, items = list_reconciliation_history(
         session,
         page=page,
         limit=limit,
         status=status,
+        user_id=(None if current_user.role == "admin" else current_user.id),
     )
+
     total_pages = (total + limit - 1) // limit
 
     return {
@@ -700,29 +703,11 @@ def get_reconciliation_history(
 def get_reconciliation_history_detail(
     job_id: uuid.UUID,
     session: Session = Depends(get_db_session),
+    current_user: User = Depends(get_current_user),
 ) -> dict[str, Any]:
     """Return one persisted reconciliation job without rerunning it."""
 
-    item = get_reconciliation_history_job(session, job_id)
-
-    if item is None:
-        raise HTTPException(
-            status_code=404,
-            detail=f"Reconciliation job '{job_id}' was not found.",
-        )
-
-    return item
-
-
-@app.get("/api/reconciliation/{job_id}/summary")
-async def get_reconciliation_summary(
-    job_id: uuid.UUID,
-    session: Session = Depends(get_db_session),
-) -> dict[str, Any]:
-    """
-    Retrieve the saved summary for a reconciliation job.
-    """
-
+    # Check whether the job exists.
     job = session.get(ReconciliationJob, job_id)
 
     if job is None:
@@ -731,15 +716,59 @@ async def get_reconciliation_summary(
             detail="Reconciliation job not found.",
         )
 
-    summary_record = session.scalar(
-        select(ReconciliationSummary).where(ReconciliationSummary.job_id == job_id)
-    )
-
-    if summary_record is None:
+    # Admins can access all jobs.
+    # Customers can access only their own jobs.
+    if current_user.role != "admin" and job.user_id != current_user.id:
         raise HTTPException(
             status_code=404,
-            detail="Summary not found for this reconciliation job.",
+            detail="Reconciliation job not found.",
         )
+
+    item = get_reconciliation_history_job(session, job_id)
+
+    if item is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Reconciliation job not found.",
+        )
+
+    return item
+
+
+@app.get("/api/reconciliation/latest/summary")
+def get_reconciliation_summary(
+    session: Session = Depends(get_db_session),
+    current_user: User = Depends(get_current_user),
+) -> dict[str, Any]:
+    """
+    Retrieve the latest saved reconciliation summary
+    belonging to the currently authenticated user.
+    """
+
+    # Find the latest job that has a saved summary.
+    job = session.scalar(
+        select(ReconciliationJob)
+        .join(
+            ReconciliationSummary,
+            ReconciliationSummary.job_id == ReconciliationJob.job_id,
+        )
+        .where(ReconciliationJob.user_id == current_user.id)
+        .order_by(
+            ReconciliationJob.created_at.desc(),
+            ReconciliationJob.job_id.desc(),
+        )
+        .limit(1)
+    )
+
+    if job is None:
+        raise HTTPException(
+            status_code=404,
+            detail="No reconciliation summary found.",
+        )
+
+    summary_record = session.scalar(
+        select(ReconciliationSummary).where(ReconciliationSummary.job_id == job.job_id)
+    )
 
     return {
         "job_id": str(job.job_id),
@@ -760,8 +789,9 @@ def _raise_service_error(exc: ServiceError) -> None:
 def create_company_endpoint(
     payload: CompanyCreate,
     session: Session = Depends(get_db_session),
+    current_user: User = Depends(require_admin),
 ) -> dict[str, Any]:
-    """Create a reusable company record."""
+    """Create a reusable company record. Admin only."""
 
     try:
         company = create_company(
@@ -781,8 +811,9 @@ def list_companies_endpoint(
     page: PageParam = DEFAULT_PAGE,
     limit: LimitParam = DEFAULT_LIMIT,
     session: Session = Depends(get_db_session),
+    current_user: User = Depends(get_current_user),
 ) -> dict[str, Any]:
-    """Return companies sorted alphabetically by name."""
+    """Return companies sorted alphabetically by name. Admin only."""
 
     total, items = list_companies(
         session,
@@ -790,6 +821,7 @@ def list_companies_endpoint(
         limit=limit,
         search=search,
     )
+
     total_pages = (total + limit - 1) // limit
 
     return {
@@ -807,8 +839,9 @@ def list_companies_endpoint(
 def get_company_endpoint(
     company_id: uuid.UUID,
     session: Session = Depends(get_db_session),
+    current_user: User = Depends(get_current_user),
 ) -> dict[str, Any]:
-    """Return one company by id."""
+    """Return one company by id. Authenticated users only."""
 
     try:
         company = get_company(session, company_id)
@@ -826,11 +859,33 @@ def create_manual_settlement_endpoint(
     job_id: uuid.UUID,
     payload: ManualSettlementCreate,
     session: Session = Depends(get_db_session),
+    current_user: User = Depends(get_current_user),
 ) -> dict[str, Any]:
     """Settle one source record against one bank row."""
 
+    # Check whether the reconciliation job exists.
+    job = session.get(ReconciliationJob, job_id)
+
+    if job is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Reconciliation job not found.",
+        )
+
+    # Customers can access only their own jobs.
+    # Admins can access any job.
+    if current_user.role != "admin" and job.user_id != current_user.id:
+        raise HTTPException(
+            status_code=404,
+            detail="Reconciliation job not found.",
+        )
+
     try:
-        settlement = create_manual_settlement(session, job_id, payload)
+        settlement = create_manual_settlement(
+            session,
+            job_id,
+            payload,
+        )
     except ServiceError as exc:
         _raise_service_error(exc)
 
@@ -843,8 +898,24 @@ def list_manual_settlements_endpoint(
     page: PageParam = DEFAULT_PAGE,
     limit: LimitParam = DEFAULT_LIMIT,
     session: Session = Depends(get_db_session),
+    current_user: User = Depends(get_current_user),
 ) -> dict[str, Any]:
     """Return manual settlements for one job, newest first."""
+
+    # Check job existence and ownership.
+    job = session.get(ReconciliationJob, job_id)
+
+    if job is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Reconciliation job not found.",
+        )
+
+    if current_user.role != "admin" and job.user_id != current_user.id:
+        raise HTTPException(
+            status_code=404,
+            detail="Reconciliation job not found.",
+        )
 
     try:
         total, items = list_manual_settlements(
@@ -870,15 +941,40 @@ def list_manual_settlements_endpoint(
     }
 
 
-@app.post(
-    "/api/reconciliation/manual-settlements/{settlement_id}/reverse",
-)
+@app.post("/api/reconciliation/manual-settlements/{settlement_id}/reverse")
 def reverse_manual_settlement_endpoint(
     settlement_id: uuid.UUID,
     payload: ManualSettlementReversal | None = None,
     session: Session = Depends(get_db_session),
+    current_user: User = Depends(get_current_user),
 ) -> dict[str, Any]:
     """Reverse an active manual settlement and restore both records."""
+
+    # Find the settlement.
+    settlement_record = session.get(ManualSettlement, settlement_id)
+
+    if settlement_record is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Manual settlement not found.",
+        )
+
+    # Find the reconciliation job associated with the settlement.
+    job = session.get(ReconciliationJob, settlement_record.job_id)
+
+    if job is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Reconciliation job not found.",
+        )
+
+    # Admins can reverse any settlement.
+    # Customers can reverse only their own settlements.
+    if current_user.role != "admin" and job.user_id != current_user.id:
+        raise HTTPException(
+            status_code=404,
+            detail="Manual settlement not found.",
+        )
 
     reason = payload.reason if payload is not None else None
 
@@ -904,20 +1000,20 @@ def get_fund_request_results(
     page: PageParam = DEFAULT_PAGE,
     limit: LimitParam = DEFAULT_LIMIT,
     session: Session = Depends(get_db_session),
+    current_user: User = Depends(get_current_user),
 ) -> dict[str, Any]:
-    """Return stored Fund Request results for a completed reconciliation job.
-
-    ``MATCHED`` maps to the engine's individually confirmed ``MATCHED`` status.
-    ``NOT_FOUND`` maps directly to the engine's ``NOT_FOUND`` status.  All other
-    engine statuses are intentionally excluded.
-
-    Results are paginated at the database level after applying the job and
-    status filters.
-    """
+    """Return stored Fund Request results for a completed reconciliation job."""
 
     job = get_reconciliation_job(session, job_id)
 
     if job is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Reconciliation job '{job_id}' was not found.",
+        )
+
+    # Admins can access all jobs; customers can access only their own.
+    if current_user.role != "admin" and job.user_id != current_user.id:
         raise HTTPException(
             status_code=404,
             detail=f"Reconciliation job '{job_id}' was not found.",
@@ -934,7 +1030,9 @@ def get_fund_request_results(
 
     internal_status = FRONTEND_STATUS_MAP[status]
     total = count_fund_request_results(session, job_id, internal_status)
+
     offset = (page - 1) * limit
+
     rows = list_fund_request_results(
         session,
         job_id,
@@ -942,6 +1040,7 @@ def get_fund_request_results(
         offset=offset,
         limit=limit,
     )
+
     total_pages = (total + limit - 1) // limit
 
     return {
@@ -967,20 +1066,20 @@ def get_va_transaction_results(
     page: PageParam = DEFAULT_PAGE,
     limit: LimitParam = DEFAULT_LIMIT,
     session: Session = Depends(get_db_session),
+    current_user: User = Depends(get_current_user),
 ) -> dict[str, Any]:
-    """Return stored VA Transaction results for a completed reconciliation job.
-
-    ``MATCHED`` maps to the engine's confirmed ``MATCHED`` status and
-    ``NOT_FOUND`` maps directly to the engine's ``NOT_FOUND`` status.  All other
-    engine statuses are intentionally excluded.
-
-    Results are paginated at the database level after applying the job, source
-    type and status filters.
-    """
+    """Return stored VA Transaction results for a completed reconciliation job."""
 
     job = get_reconciliation_job(session, job_id)
 
     if job is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Reconciliation job '{job_id}' was not found.",
+        )
+
+    # Admins can access all jobs; customers can access only their own.
+    if current_user.role != "admin" and job.user_id != current_user.id:
         raise HTTPException(
             status_code=404,
             detail=f"Reconciliation job '{job_id}' was not found.",
@@ -996,8 +1095,11 @@ def get_va_transaction_results(
         )
 
     internal_status = FRONTEND_STATUS_MAP[status]
+
     total = count_va_transaction_results(session, job_id, internal_status)
+
     offset = (page - 1) * limit
+
     rows = list_va_transaction_results(
         session,
         job_id,
@@ -1005,6 +1107,7 @@ def get_va_transaction_results(
         offset=offset,
         limit=limit,
     )
+
     total_pages = (total + limit - 1) // limit
 
     return {
@@ -1030,20 +1133,20 @@ def get_bank_transaction_results(
     page: PageParam = DEFAULT_PAGE,
     limit: LimitParam = DEFAULT_LIMIT,
     session: Session = Depends(get_db_session),
+    current_user: User = Depends(get_current_user),
 ) -> dict[str, Any]:
-    """Return stored Bank Transaction results for a completed job.
-
-    ``MATCHED`` returns confirmed bank rows that were linked to a Fund Request
-    or VA transaction by the matching engine.  ``NOT_FOUND`` returns bank rows
-    that were persisted in the unmatched bank table, meaning no Fund Request or
-    VA transaction was allocated to them.
-
-    Job and status filters are applied before database-level pagination.
-    """
+    """Return stored Bank Transaction results for a completed job."""
 
     job = get_reconciliation_job(session, job_id)
 
     if job is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Reconciliation job '{job_id}' was not found.",
+        )
+
+    # Admins can access all jobs; customers can access only their own.
+    if current_user.role != "admin" and job.user_id != current_user.id:
         raise HTTPException(
             status_code=404,
             detail=f"Reconciliation job '{job_id}' was not found.",
@@ -1097,12 +1200,22 @@ def get_bank_transaction_results(
 CSV_MEDIA_TYPE = "text/csv; charset=utf-8"
 
 
-def _require_completed_job(session: Session, job_id: uuid.UUID):
-    """Validate the job used by an export without changing existing routes."""
+def _require_completed_job(
+    session: Session,
+    job_id: uuid.UUID,
+    current_user: User,
+):
+    """Validate job existence, ownership and completion."""
 
     job = get_reconciliation_job(session, job_id)
 
     if job is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Reconciliation job '{job_id}' was not found.",
+        )
+
+    if current_user.role != "admin" and job.user_id != current_user.id:
         raise HTTPException(
             status_code=404,
             detail=f"Reconciliation job '{job_id}' was not found.",
@@ -1137,10 +1250,11 @@ def export_fund_request_results(
     job_id: uuid.UUID,
     status: FundRequestStatus = Query(...),
     session: Session = Depends(get_db_session),
+    current_user: User = Depends(get_current_user),
 ) -> StreamingResponse:
     """Download every persisted Fund Request result for one status."""
 
-    _require_completed_job(session, job_id)
+    _require_completed_job(session, job_id, current_user)
 
     return _csv_download(
         fund_request_csv(
@@ -1157,10 +1271,11 @@ def export_va_transaction_results(
     job_id: uuid.UUID,
     status: VATransactionStatus = Query(...),
     session: Session = Depends(get_db_session),
+    current_user: User = Depends(get_current_user),
 ) -> StreamingResponse:
     """Download every persisted VA Transaction result for one status."""
 
-    _require_completed_job(session, job_id)
+    _require_completed_job(session, job_id, current_user)
 
     return _csv_download(
         va_transaction_csv(
@@ -1177,10 +1292,11 @@ def export_bank_transaction_results(
     job_id: uuid.UUID,
     status: BankTransactionStatus = Query(...),
     session: Session = Depends(get_db_session),
+    current_user: User = Depends(get_current_user),
 ) -> StreamingResponse:
     """Download every persisted bank transaction result for one status."""
 
-    _require_completed_job(session, job_id)
+    _require_completed_job(session, job_id, current_user)
 
     bind = session.get_bind()
 
@@ -1193,3 +1309,173 @@ def export_bank_transaction_results(
         content,
         build_export_filename("bank_transactions", status, job_id),
     )
+
+
+@app.post("/api/auth/login", response_model=LoginResponse)
+def login(
+    data: LoginRequest,
+    response: Response,
+    db: Session = Depends(get_db),
+):
+    user = db.query(User).filter(User.mobile_number == data.mobile_number).first()
+
+    if not user or not verify_password(
+        data.password,
+        user.hashed_password,
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid mobile number or password",
+        )
+
+    access_token = create_access_token(str(user.id))
+    refresh_token = create_refresh_token(str(user.id))
+
+    user.refresh_token_hash = hash_refresh_token(refresh_token)
+    db.commit()
+
+    response.set_cookie(
+        key="access_token",
+        value=access_token,
+        httponly=True,
+        secure=settings.COOKIE_SECURE,
+        samesite=settings.COOKIE_SAMESITE,
+        max_age=settings.ACCESS_TOKEN_EXPIRE_MINUTES * 60,
+        path="/",
+    )
+
+    response.set_cookie(
+        key="refresh_token",
+        value=refresh_token,
+        httponly=True,
+        secure=settings.COOKIE_SECURE,
+        samesite=settings.COOKIE_SAMESITE,
+        max_age=settings.REFRESH_TOKEN_EXPIRE_MINUTES * 60,
+        path="/api/auth",
+    )
+
+    return LoginResponse(message="Login successful")
+
+
+@app.post("/api/auth/logout")
+def logout(
+    response: Response,
+    refresh_token: str | None = Cookie(default=None),
+    db: Session = Depends(get_db),
+):
+    if refresh_token:
+        try:
+            payload = decode_refresh_token(refresh_token)
+
+            if payload.get("type") == "refresh":
+                user_id = uuid.UUID(payload["sub"])
+
+                user = db.get(User, user_id)
+
+                if (
+                    user
+                    and user.refresh_token_hash
+                    and user.refresh_token_hash == hash_refresh_token(refresh_token)
+                ):
+                    user.refresh_token_hash = None
+                    db.commit()
+
+        except (InvalidTokenError, ValueError, KeyError, TypeError):
+            pass
+
+    response.delete_cookie(
+        key="access_token",
+        path="/",
+        secure=settings.COOKIE_SECURE,
+        httponly=True,
+        samesite=settings.COOKIE_SAMESITE,
+    )
+
+    response.delete_cookie(
+        key="refresh_token",
+        path="/api/auth",
+        secure=settings.COOKIE_SECURE,
+        httponly=True,
+        samesite=settings.COOKIE_SAMESITE,
+    )
+
+    return {"message": "Logout successful"}
+
+
+@app.post("/api/auth/refresh")
+def refresh_access_token(
+    response: Response,
+    refresh_token: str | None = Cookie(default=None),
+    db: Session = Depends(get_db),
+):
+    # Check whether the refresh token cookie exists.
+    if not refresh_token:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Refresh token required",
+        )
+
+    # Decode and validate the refresh token.
+    try:
+        payload = decode_refresh_token(refresh_token)
+
+        if payload.get("type") != "refresh":
+            raise InvalidTokenError("Invalid token type")
+
+        user_id = uuid.UUID(payload["sub"])
+
+    except (InvalidTokenError, ValueError, KeyError, TypeError):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or expired refresh token",
+        )
+
+    # Find the user.
+    user = db.get(User, user_id)
+
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="User not found",
+        )
+
+    # Verify that this refresh token is the user's current token.
+    if not user.refresh_token_hash or user.refresh_token_hash != hash_refresh_token(
+        refresh_token
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid refresh token",
+        )
+
+    # Generate new tokens.
+    new_access_token = create_access_token(str(user.id))
+    new_refresh_token = create_refresh_token(str(user.id))
+
+    # Rotate the stored refresh token hash.
+    user.refresh_token_hash = hash_refresh_token(new_refresh_token)
+    db.commit()
+
+    # Set the new access token cookie.
+    response.set_cookie(
+        key="access_token",
+        value=new_access_token,
+        httponly=True,
+        secure=settings.COOKIE_SECURE,
+        samesite=settings.COOKIE_SAMESITE,
+        max_age=settings.ACCESS_TOKEN_EXPIRE_MINUTES * 60,
+        path="/",
+    )
+
+    # Set the new refresh token cookie.
+    response.set_cookie(
+        key="refresh_token",
+        value=new_refresh_token,
+        httponly=True,
+        secure=settings.COOKIE_SECURE,
+        samesite=settings.COOKIE_SAMESITE,
+        max_age=settings.REFRESH_TOKEN_EXPIRE_MINUTES * 60,
+        path="/api/auth",
+    )
+
+    return {"message": "Tokens refreshed successfully"}
