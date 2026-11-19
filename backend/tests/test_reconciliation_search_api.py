@@ -642,3 +642,458 @@ def test_matched_bank_filters_do_not_duplicate_rows(client, seeded_session):
     assert by_reference.json()["total"] == 1
     assert by_row.json()["total"] == 1
     assert len(by_row.json()["items"]) == 1
+
+
+# ---------------------------------------------------------------------------
+# Universal ``search`` parameter (one search box across all six APIs)
+# ---------------------------------------------------------------------------
+
+UNIVERSAL_REFERENCE_CASES = [
+    ("fund_matched", "UTRFRMATCH1", 1),
+    ("fund_unmatched", "UTRFRUNM", 1),
+    ("va_matched", "UTRVAMATCH", 1),
+    ("va_unmatched", "UTRVAUNM2", 1),
+    ("bank_matched", "UTRBANK19", 1),
+    ("bank_unmatched", "UTRUNMATCHED21", 1),
+]
+
+UNIVERSAL_NAME_CASES = [
+    ("fund_matched", "MONEXIS", 1),
+    ("fund_unmatched", "ALPHA", 1),
+    ("va_matched", "MONEXIS", 1),
+    ("va_unmatched", "BETA", 2),
+    ("bank_matched", "MONEXIS", 2),
+    ("bank_unmatched", "MONEXIS", 1),
+]
+
+UNIVERSAL_BANK_CASES = [
+    ("fund_matched", "KOTAK", 2),
+    ("fund_unmatched", "HDFC", 1),
+    ("va_matched", "KOTAK", 1),
+    ("va_unmatched", "HDFC", 2),
+    ("bank_matched", "KOTAK", 2),
+    ("bank_unmatched", "HDFC", 2),
+]
+
+UNIVERSAL_AMOUNT_CASES = [
+    ("fund_matched", "100.0000", 2),
+    ("fund_unmatched", "50000", 1),
+    ("va_matched", "200", 1),
+    ("va_unmatched", "50000", 2),
+    ("bank_matched", "100", 1),
+    ("bank_unmatched", "300", 1),
+]
+
+UNIVERSAL_ROW_CASES = [
+    ("fund_matched", "0019", 2),
+    ("fund_unmatched", "0019", 0),
+    ("va_matched", "0020", 1),
+    ("va_unmatched", "0020", 0),
+    ("bank_matched", "0019", 1),
+    ("bank_unmatched", "0021", 1),
+]
+
+UNIVERSAL_CASE_INSENSITIVE_CASES = [
+    ("fund_matched", "utrfrmatch1", 1),
+    ("fund_unmatched", "utrfrunm", 1),
+    ("va_matched", "utrvamatch", 1),
+    ("va_unmatched", "utrvaunm2", 1),
+    ("bank_matched", "utrbank19", 1),
+    ("bank_unmatched", "ref-u21", 1),
+]
+
+UNIVERSAL_PARTIAL_CASES = [
+    ("fund_matched", "FRMATCH", 1),
+    ("fund_unmatched", "FR-UNM", 1),
+    ("va_matched", "VAMATCH", 1),
+    ("va_unmatched", "UNM2", 1),
+    ("bank_matched", "ANK19", 1),
+    ("bank_unmatched", "MATCHED21", 1),
+]
+
+UNIVERSAL_NUMERIC_REFERENCE_CASES = [
+    ("va_matched", "123", 1),
+    ("fund_matched", "1", 2),
+    ("va_unmatched", "1", 1),
+    ("bank_matched", "19", 1),
+    ("bank_unmatched", "23", 1),
+]
+
+UNIVERSAL_NULL_FIELD_CASES = [
+    ("fund_unmatched", "UTRBANK", 0),
+    ("va_unmatched", "BANKREF", 0),
+    ("fund_matched", "VA123", 0),
+    ("bank_unmatched", "%", 0),
+    ("bank_unmatched", "_", 0),
+]
+
+UNIVERSAL_STATUS_CASES = [
+    ("fund-requests", "MATCHED", "MONEXIS", 1),
+    ("fund-requests", "NOT_FOUND", "MONEXIS", 0),
+    ("va-transactions", "MATCHED", "MONEXIS", 1),
+    ("va-transactions", "NOT_FOUND", "MONEXIS", 0),
+    ("bank-transactions", "MATCHED", "MONEXIS", 2),
+    ("bank-transactions", "NOT_FOUND", "MONEXIS", 1),
+]
+
+UNIVERSAL_WITH_INDIVIDUAL_CASES = [
+    ("fund_matched", {"reference": "UTRFRMATCH1"}, 1),
+    ("fund_matched", {"amount": "100"}, 1),
+    ("fund_matched", {"name": "monexis"}, 1),
+    ("fund_matched", {"bank": "KOTAK"}, 1),
+    ("fund_matched", {"bank_row_number": 19}, 1),
+    ("bank_unmatched", {"reference": "UTRUNMATCHED21"}, 1),
+    ("bank_unmatched", {"amount": "300"}, 1),
+    ("bank_unmatched", {"name": "MONEXIS"}, 1),
+    ("bank_unmatched", {"bank": "KOTAK"}, 1),
+    ("bank_unmatched", {"bank_row_number": 21}, 1),
+]
+
+UNIVERSAL_AND_CASES = [
+    ("fund_matched", "MONEXIS", {"bank": "HDFC"}, 0),
+    ("fund_matched", "KOTAK", {"amount": "100"}, 2),
+    ("va_unmatched", "HDFC", {"amount": "100"}, 0),
+    ("bank_unmatched", "MONEXIS", {"bank": "HDFC"}, 0),
+    ("bank_matched", "KOTAK", {"bank_row_number": 20}, 1),
+]
+
+UNIVERSAL_PAGINATION_CASES = [
+    ("fund_matched", "KOTAK", 2),
+    ("va_unmatched", "50000", 2),
+    ("bank_matched", "MONEXIS", 2),
+    ("bank_unmatched", "HDFC", 2),
+]
+
+UNIVERSAL_LINKED_SOURCE_CASES = [
+    ("UTRFRMATCH1", 1),
+    ("REF-FR-1", 1),
+    ("FR-1", 1),
+    ("MONEXIS PVT", 1),
+    ("UTRVAMATCH", 1),
+]
+
+UNIVERSAL_INDIVIDUAL_FILTER_CASES = [
+    ("fund_matched", {"reference": "UTRFRMATCH1"}, 1),
+    ("fund_unmatched", {"amount": "50000"}, 1),
+    ("va_matched", {"name": "MONEXIS"}, 1),
+    ("va_unmatched", {"bank": "HDFC"}, 2),
+    ("bank_matched", {"bank_row_number": 19}, 1),
+    ("bank_unmatched", {"reference": "REF-U22"}, 1),
+]
+
+
+@pytest.mark.parametrize(("api", "term", "expected"), UNIVERSAL_REFERENCE_CASES)
+def test_universal_search_by_reference(client, seeded_session, api, term, expected):
+    response = _get(client, api, search=term)
+
+    assert response.status_code == 200, response.text
+    assert response.json()["total"] == expected
+
+
+@pytest.mark.parametrize(("api", "term", "expected"), UNIVERSAL_NAME_CASES)
+def test_universal_search_by_name(client, seeded_session, api, term, expected):
+    response = _get(client, api, search=term)
+
+    assert response.status_code == 200, response.text
+    assert response.json()["total"] == expected
+
+
+@pytest.mark.parametrize(("api", "term", "expected"), UNIVERSAL_BANK_CASES)
+def test_universal_search_by_bank(client, seeded_session, api, term, expected):
+    response = _get(client, api, search=term)
+
+    assert response.status_code == 200, response.text
+    assert response.json()["total"] == expected
+
+
+@pytest.mark.parametrize(("api", "term", "expected"), UNIVERSAL_AMOUNT_CASES)
+def test_universal_search_matches_exact_amount(
+    client,
+    seeded_session,
+    api,
+    term,
+    expected,
+):
+    response = _get(client, api, search=term)
+
+    assert response.status_code == 200, response.text
+    assert response.json()["total"] == expected
+
+
+@pytest.mark.parametrize(("api", "term", "expected"), UNIVERSAL_ROW_CASES)
+def test_universal_search_matches_exact_bank_row_number(
+    client,
+    seeded_session,
+    api,
+    term,
+    expected,
+):
+    # Zero-padded terms parse as the same integer but never appear literally
+    # in the UTR text, proving the integer interpretation is exercised.
+    response = _get(client, api, search=term)
+
+    assert response.status_code == 200, response.text
+    assert response.json()["total"] == expected
+
+
+@pytest.mark.parametrize(
+    ("api", "term", "expected"), UNIVERSAL_NUMERIC_REFERENCE_CASES
+)
+def test_universal_numeric_search_also_matches_references(
+    client,
+    seeded_session,
+    api,
+    term,
+    expected,
+):
+    response = _get(client, api, search=term)
+
+    assert response.status_code == 200, response.text
+    assert response.json()["total"] == expected
+
+
+@pytest.mark.parametrize(
+    ("api", "term", "expected"), UNIVERSAL_CASE_INSENSITIVE_CASES
+)
+def test_universal_search_is_case_insensitive(
+    client,
+    seeded_session,
+    api,
+    term,
+    expected,
+):
+    response = _get(client, api, search=term)
+
+    assert response.status_code == 200, response.text
+    assert response.json()["total"] == expected
+
+
+@pytest.mark.parametrize(("api", "term", "expected"), UNIVERSAL_PARTIAL_CASES)
+def test_universal_search_is_partial(client, seeded_session, api, term, expected):
+    response = _get(client, api, search=term)
+
+    assert response.status_code == 200, response.text
+    assert response.json()["total"] == expected
+
+
+@pytest.mark.parametrize(("api", "term", "expected"), UNIVERSAL_NULL_FIELD_CASES)
+def test_universal_search_handles_null_fields_and_literal_wildcards(
+    client,
+    seeded_session,
+    api,
+    term,
+    expected,
+):
+    response = _get(client, api, search=term)
+
+    assert response.status_code == 200, response.text
+    assert response.json()["total"] == expected
+    assert response.json()["items"] == []
+
+
+@pytest.mark.parametrize("api", list(APIS))
+def test_universal_blank_search_is_ignored(client, seeded_session, api):
+    empty = _get(client, api, search="")
+    whitespace = _get(client, api, search="   ")
+
+    assert empty.status_code == 200, empty.text
+    assert whitespace.status_code == 200, whitespace.text
+    assert empty.json()["total"] == EXPECTED_TOTALS[api]
+    assert whitespace.json()["total"] == EXPECTED_TOTALS[api]
+
+
+@pytest.mark.parametrize("api", list(APIS))
+def test_universal_search_trims_whitespace(client, seeded_session, api):
+    plain = _get(client, api, search="MONEXIS")
+    trimmed = _get(client, api, search="  MONEXIS  ")
+
+    assert trimmed.status_code == 200, trimmed.text
+    assert trimmed.json() == plain.json()
+
+
+@pytest.mark.parametrize(
+    ("path", "status", "term", "expected"), UNIVERSAL_STATUS_CASES
+)
+def test_universal_search_preserves_status_classification(
+    client,
+    seeded_session,
+    path,
+    status,
+    term,
+    expected,
+):
+    response = client.get(
+        f"/api/reconciliation/{JOB}/{path}",
+        params={"status": status, "search": term},
+    )
+
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    assert payload["status"] == status
+    assert payload["total"] == expected
+
+
+@pytest.mark.parametrize(("api", "extra", "expected"), UNIVERSAL_WITH_INDIVIDUAL_CASES)
+def test_universal_search_combines_with_each_individual_filter(
+    client,
+    seeded_session,
+    api,
+    extra,
+    expected,
+):
+    response = _get(client, api, search="MONEXIS", **extra)
+
+    assert response.status_code == 200, response.text
+    assert response.json()["total"] == expected
+
+
+@pytest.mark.parametrize(
+    ("api", "term", "extra", "expected"), UNIVERSAL_AND_CASES
+)
+def test_universal_search_and_individual_filters_use_and(
+    client,
+    seeded_session,
+    api,
+    term,
+    extra,
+    expected,
+):
+    response = _get(client, api, search=term, **extra)
+
+    assert response.status_code == 200, response.text
+    assert response.json()["total"] == expected
+
+
+@pytest.mark.parametrize(("api", "term", "expected"), UNIVERSAL_PAGINATION_CASES)
+def test_universal_search_has_accurate_totals_and_pagination(
+    client,
+    seeded_session,
+    api,
+    term,
+    expected,
+):
+    first = _get(client, api, search=term, page=1, limit=1)
+    second = _get(client, api, search=term, page=2, limit=1)
+
+    assert first.status_code == 200, first.text
+    assert second.status_code == 200, second.text
+
+    first_payload = first.json()
+    second_payload = second.json()
+
+    assert first_payload["total"] == expected
+    assert first_payload["total_pages"] == expected
+    assert first_payload["limit"] == 1
+    assert first_payload["has_next"] is True
+    assert first_payload["has_previous"] is False
+    assert len(first_payload["items"]) == 1
+
+    assert second_payload["total"] == expected
+    assert second_payload["has_next"] is False
+    assert second_payload["has_previous"] is True
+    assert len(second_payload["items"]) == 1
+
+    assert first_payload["items"][0] != second_payload["items"][0]
+
+
+@pytest.mark.parametrize(("term", "expected"), UNIVERSAL_LINKED_SOURCE_CASES)
+def test_universal_matched_bank_search_covers_linked_source_fields(
+    client,
+    seeded_session,
+    term,
+    expected,
+):
+    response = _get(client, "bank_matched", search=term)
+
+    assert response.status_code == 200, response.text
+    assert response.json()["total"] == expected
+
+
+@pytest.mark.parametrize(
+    ("term", "expected"),
+    [
+        ("MONEXIS", 2),
+        ("UTRBANK19", 1),
+        ("0019", 1),
+        ("100", 1),
+        ("KOTAK", 2),
+    ],
+)
+def test_universal_search_does_not_duplicate_matched_bank_rows(
+    client,
+    seeded_session,
+    term,
+    expected,
+):
+    response = _get(client, "bank_matched", search=term)
+
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    assert payload["total"] == expected
+    assert len(payload["items"]) == expected
+
+    rows = [item["bank_row_number"] for item in payload["items"]]
+    assert len(rows) == len(set(rows))
+
+
+@pytest.mark.parametrize("api", list(APIS))
+def test_universal_empty_result(client, seeded_session, api):
+    response = _get(client, api, search="DOES-NOT-EXIST")
+
+    assert response.status_code == 200, response.text
+    assert response.json()["total"] == 0
+    assert response.json()["items"] == []
+    assert response.json()["total_pages"] == 0
+    assert response.json()["has_next"] is False
+
+
+@pytest.mark.parametrize(("api", "extra", "expected"), UNIVERSAL_INDIVIDUAL_FILTER_CASES)
+def test_existing_individual_filters_still_work_without_search(
+    client,
+    seeded_session,
+    api,
+    extra,
+    expected,
+):
+    response = _get(client, api, **extra)
+
+    assert response.status_code == 200, response.text
+    assert response.json()["total"] == expected
+
+
+@pytest.mark.parametrize("api", list(APIS))
+def test_universal_search_keeps_response_structure(client, seeded_session, api):
+    response = _get(client, api, search="MONEXIS")
+
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    assert set(payload) == {
+        "job_id",
+        "status",
+        "total",
+        "page",
+        "limit",
+        "total_pages",
+        "has_next",
+        "has_previous",
+        "items",
+    }
+    assert payload["status"] == APIS[api][1]
+    assert payload["limit"] == 100
+    for item in payload["items"]:
+        assert "source_transaction_id" in item
+        assert "bank_name" in item
+        assert "bank_row_number" in item
+
+
+@pytest.mark.parametrize("api", list(APIS))
+def test_optional_search_does_not_change_no_filter_behavior(
+    client,
+    seeded_session,
+    api,
+):
+    without_search = _get(client, api)
+    with_blank_search = _get(client, api, search="   ")
+
+    assert without_search.json() == with_blank_search.json()
+    assert without_search.json()["total"] == EXPECTED_TOTALS[api]

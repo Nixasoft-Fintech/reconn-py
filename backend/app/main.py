@@ -1007,6 +1007,7 @@ FundRequestStatus = Literal["MATCHED", "NOT_FOUND"]
 def get_fund_request_results(
     job_id: uuid.UUID,
     status: FundRequestStatus = Query(...),
+    search: TextFilterParam = None,
     reference: TextFilterParam = None,
     amount: AmountFilterParam = None,
     name: TextFilterParam = None,
@@ -1044,18 +1045,19 @@ def get_fund_request_results(
         )
 
     internal_status = FRONTEND_STATUS_MAP[status]
-    search = ResultSearchFilters(
+    filters = ResultSearchFilters(
         reference=reference,
         amount=amount,
         name=name,
         bank=bank,
         bank_row_number=bank_row_number,
+        search=search,
     )
     total = count_fund_request_results(
         session,
         job_id,
         internal_status,
-        search,
+        filters,
     )
 
     offset = (page - 1) * limit
@@ -1064,7 +1066,7 @@ def get_fund_request_results(
         session,
         job_id,
         internal_status,
-        search=search,
+        search=filters,
         offset=offset,
         limit=limit,
     )
@@ -1091,6 +1093,7 @@ VATransactionStatus = Literal["MATCHED", "NOT_FOUND"]
 def get_va_transaction_results(
     job_id: uuid.UUID,
     status: VATransactionStatus = Query(...),
+    search: TextFilterParam = None,
     reference: TextFilterParam = None,
     amount: AmountFilterParam = None,
     name: TextFilterParam = None,
@@ -1128,19 +1131,20 @@ def get_va_transaction_results(
         )
 
     internal_status = FRONTEND_STATUS_MAP[status]
-    search = ResultSearchFilters(
+    filters = ResultSearchFilters(
         reference=reference,
         amount=amount,
         name=name,
         bank=bank,
         bank_row_number=bank_row_number,
+        search=search,
     )
 
     total = count_va_transaction_results(
         session,
         job_id,
         internal_status,
-        search,
+        filters,
     )
 
     offset = (page - 1) * limit
@@ -1149,7 +1153,7 @@ def get_va_transaction_results(
         session,
         job_id,
         internal_status,
-        search=search,
+        search=filters,
         offset=offset,
         limit=limit,
     )
@@ -1176,6 +1180,7 @@ BankTransactionStatus = Literal["MATCHED", "NOT_FOUND"]
 def get_bank_transaction_results(
     job_id: uuid.UUID,
     status: BankTransactionStatus = Query(...),
+    search: TextFilterParam = None,
     reference: TextFilterParam = None,
     amount: AmountFilterParam = None,
     name: TextFilterParam = None,
@@ -1213,24 +1218,25 @@ def get_bank_transaction_results(
         )
 
     offset = (page - 1) * limit
-    search = ResultSearchFilters(
+    filters = ResultSearchFilters(
         reference=reference,
         amount=amount,
         name=name,
         bank=bank,
         bank_row_number=bank_row_number,
+        search=search,
     )
 
     if status == "MATCHED":
         total = count_matched_bank_transactions(
             session,
             job_id,
-            search,
+            filters,
         )
         rows = list_matched_bank_transactions(
             session,
             job_id,
-            search=search,
+            search=filters,
             offset=offset,
             limit=limit,
         )
@@ -1239,12 +1245,12 @@ def get_bank_transaction_results(
         total = count_unmatched_bank_transactions(
             session,
             job_id,
-            search,
+            filters,
         )
         rows = list_unmatched_bank_transactions(
             session,
             job_id,
-            search=search,
+            search=filters,
             offset=offset,
             limit=limit,
         )

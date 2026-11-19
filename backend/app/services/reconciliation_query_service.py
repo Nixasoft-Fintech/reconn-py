@@ -11,7 +11,7 @@ import uuid
 from collections.abc import Iterator
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from typing import Any
 
 from sqlalchemy import case, func, or_, select
@@ -50,6 +50,7 @@ class ResultSearchFilters:
     name: str | None = None
     bank: str | None = None
     bank_row_number: int | None = None
+    search: str | None = None
 
 
 def _clean_text(value: str | None) -> str | None:
@@ -74,6 +75,64 @@ def _contains_any(columns: tuple, value: str | None):
     )
 
 
+def _try_decimal(value: str) -> Decimal | None:
+    """Parse a search term as a finite decimal, or ``None`` when invalid."""
+
+    try:
+        parsed = Decimal(value)
+    except (InvalidOperation, ValueError):
+        return None
+    return parsed if parsed.is_finite() else None
+
+
+def _try_int(value: str) -> int | None:
+    """Parse a search term as an integer, or ``None`` when invalid."""
+
+    try:
+        return int(value)
+    except ValueError:
+        return None
+
+
+def _universal_search_condition(
+    search: str | None,
+    *,
+    text_columns: tuple,
+    amount_column,
+    bank_row_number_column=None,
+):
+    """Build an OR condition spanning every field of the universal search.
+
+    Text fields always use case-insensitive partial matching.  A numeric term
+    is additionally checked as an exact amount and as an exact bank row number
+    so a single search box can find references, amounts and row numbers without
+    guessing which interpretation the caller intended.
+    """
+
+    needle = _clean_text(search)
+    if needle is None:
+        return None
+
+    conditions = []
+
+    text_match = _contains_any(text_columns, needle)
+    if text_match is not None:
+        conditions.append(text_match)
+
+    amount = _try_decimal(needle)
+    if amount is not None and amount_column is not None:
+        conditions.append(amount_column == amount)
+
+    row_number = _try_int(needle)
+    if row_number is not None and bank_row_number_column is not None:
+        conditions.append(bank_row_number_column == row_number)
+
+    if not conditions:
+        return None
+
+    return or_(*conditions)
+
+
 def _search_conditions(
     search: ResultSearchFilters | None,
     *,
@@ -82,6 +141,7 @@ def _search_conditions(
     name_columns: tuple,
     bank_columns: tuple,
     bank_row_number_column=None,
+    universal_extra_columns: tuple = (),
 ) -> list:
     """Build the AND-combined database filters for one result source."""
 
@@ -110,6 +170,20 @@ def _search_conditions(
         and bank_row_number_column is not None
     ):
         conditions.append(bank_row_number_column == search.bank_row_number)
+
+    universal = _universal_search_condition(
+        search.search,
+        text_columns=(
+            reference_columns
+            + name_columns
+            + bank_columns
+            + universal_extra_columns
+        ),
+        amount_column=amount_column,
+        bank_row_number_column=bank_row_number_column,
+    )
+    if universal is not None:
+        conditions.append(universal)
 
     return conditions
 
@@ -363,6 +437,10 @@ def _matched_bank_row_ranking(
             name_columns=MATCHED_BANK_NAME_COLUMNS,
             bank_columns=MATCHED_BANK_COLUMNS,
             bank_row_number_column=ReconciliationResult.bank_row_number,
+            universal_extra_columns=(
+                ReconciliationResult.source_user,
+                ReconciliationResult.source_bank,
+            ),
         )
     )
 
