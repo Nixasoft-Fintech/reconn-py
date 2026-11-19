@@ -24,6 +24,8 @@ from app.core.file_reader import BankStatementReadResult
 
 # Common narration words and metadata markers that are not party names.
 NARRATION_STOPWORDS = {
+    "RECD",
+    "BILL",
     "NEFT",
     "IMPS",
     "RTGS",
@@ -134,6 +136,10 @@ def extract_party_from_narration(narration: str | None) -> str | None:
         for part in re.split(r"[/|,:;*]+|\\s+-\\s+", text)
         if part and part.strip()
     ]
+
+    # Remove the transaction prefix when it is attached to the narration.
+    if segments and segments[0] == "RECD":
+        segments = segments[1:]
 
     candidates: list[str] = []
     for segment in segments:
