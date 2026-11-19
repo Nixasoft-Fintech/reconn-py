@@ -171,10 +171,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title=APP_TITLE, version="0.1.0", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:5173",
-        "http://127.0.0.1:5173",
-    ],
+    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173","https://reconn-dashboard.vercel.app/"],
     allow_credentials=True,
     allow_methods=["GET", "POST"],
     allow_headers=["*"],
