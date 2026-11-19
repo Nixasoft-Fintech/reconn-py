@@ -9,11 +9,12 @@ from __future__ import annotations
 import uuid
 
 from collections.abc import Iterator
+from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from decimal import Decimal
 from typing import Any
 
-from sqlalchemy import case, func, select
+from sqlalchemy import case, func, or_, select
 from sqlalchemy.orm import Session
 
 from app.database.connection import SessionLocal
@@ -40,6 +41,115 @@ FRONTEND_STATUS_MAP: dict[str, str] = {
 }
 
 
+@dataclass(frozen=True)
+class ResultSearchFilters:
+    """Optional filters shared by the six reconciliation list APIs."""
+
+    reference: str | None = None
+    amount: Decimal | None = None
+    name: str | None = None
+    bank: str | None = None
+    bank_row_number: int | None = None
+
+
+def _clean_text(value: str | None) -> str | None:
+    value = value.strip() if value is not None else None
+    return value or None
+
+
+def _contains_any(columns: tuple, value: str | None):
+    """Return a case-insensitive partial match across ``columns``."""
+
+    needle = _clean_text(value)
+
+    if needle is None:
+        return None
+
+    lowered = needle.lower()
+    return or_(
+        *(
+            func.lower(column).contains(lowered, autoescape=True)
+            for column in columns
+        )
+    )
+
+
+def _search_conditions(
+    search: ResultSearchFilters | None,
+    *,
+    reference_columns: tuple,
+    amount_column,
+    name_columns: tuple,
+    bank_columns: tuple,
+    bank_row_number_column=None,
+) -> list:
+    """Build the AND-combined database filters for one result source."""
+
+    if search is None:
+        return []
+
+    conditions = []
+
+    reference = _contains_any(reference_columns, search.reference)
+    if reference is not None:
+        conditions.append(reference)
+
+    if search.amount is not None and amount_column is not None:
+        conditions.append(amount_column == search.amount)
+
+    name = _contains_any(name_columns, search.name)
+    if name is not None:
+        conditions.append(name)
+
+    bank = _contains_any(bank_columns, search.bank)
+    if bank is not None:
+        conditions.append(bank)
+
+    if (
+        search.bank_row_number is not None
+        and bank_row_number_column is not None
+    ):
+        conditions.append(bank_row_number_column == search.bank_row_number)
+
+    return conditions
+
+
+SOURCE_REFERENCE_COLUMNS = (
+    ReconciliationResult.source_utr,
+    ReconciliationResult.source_reference,
+    ReconciliationResult.source_transaction_id,
+    ReconciliationResult.source_virtual_account_number,
+    ReconciliationResult.bank_utr,
+    ReconciliationResult.bank_reference,
+)
+SOURCE_NAME_COLUMNS = (ReconciliationResult.source_user,)
+SOURCE_BANK_COLUMNS = (
+    ReconciliationResult.source_bank,
+    ReconciliationResult.bank_name,
+)
+
+MATCHED_BANK_REFERENCE_COLUMNS = (
+    ReconciliationResult.bank_utr,
+    ReconciliationResult.bank_reference,
+    ReconciliationResult.source_utr,
+    ReconciliationResult.source_reference,
+    ReconciliationResult.source_transaction_id,
+    ReconciliationResult.source_virtual_account_number,
+)
+MATCHED_BANK_NAME_COLUMNS = (
+    ReconciliationResult.bank_user,
+    ReconciliationResult.bank_account_holder,
+)
+MATCHED_BANK_COLUMNS = (ReconciliationResult.bank_name,)
+
+UNMATCHED_BANK_REFERENCE_COLUMNS = (
+    UnmatchedBankTransaction.utr,
+    UnmatchedBankTransaction.reference,
+)
+UNMATCHED_BANK_NAME_COLUMNS = (UnmatchedBankTransaction.account_holder,)
+UNMATCHED_BANK_COLUMNS = (UnmatchedBankTransaction.bank_name,)
+
+
 def get_db_session() -> Iterator[Session]:
     """Yield a database session for read-only request handling."""
 
@@ -63,14 +173,26 @@ def _source_result_filters(
     job_id: uuid.UUID,
     source_type: str,
     internal_status: str,
+    search: ResultSearchFilters | None = None,
 ) -> tuple:
     """Return the filters shared by counting and listing source results."""
 
-    return (
+    filters = [
         ReconciliationResult.job_id == job_id,
         ReconciliationResult.source_type == source_type,
         ReconciliationResult.final_status == internal_status,
+    ]
+    filters.extend(
+        _search_conditions(
+            search,
+            reference_columns=SOURCE_REFERENCE_COLUMNS,
+            amount_column=ReconciliationResult.source_amount,
+            name_columns=SOURCE_NAME_COLUMNS,
+            bank_columns=SOURCE_BANK_COLUMNS,
+            bank_row_number_column=ReconciliationResult.bank_row_number,
+        )
     )
+    return tuple(filters)
 
 
 def _count_source_results(
@@ -78,11 +200,19 @@ def _count_source_results(
     job_id: uuid.UUID,
     source_type: str,
     internal_status: str,
+    search: ResultSearchFilters | None = None,
 ) -> int:
     statement = (
         select(func.count())
         .select_from(ReconciliationResult)
-        .where(*_source_result_filters(job_id, source_type, internal_status))
+        .where(
+            *_source_result_filters(
+                job_id,
+                source_type,
+                internal_status,
+                search,
+            )
+        )
     )
 
     return int(session.scalar(statement) or 0)
@@ -94,12 +224,20 @@ def _list_source_results(
     source_type: str,
     internal_status: str,
     *,
+    search: ResultSearchFilters | None = None,
     offset: int = 0,
     limit: int | None = None,
 ) -> list[ReconciliationResult]:
     statement = (
         select(ReconciliationResult)
-        .where(*_source_result_filters(job_id, source_type, internal_status))
+        .where(
+            *_source_result_filters(
+                job_id,
+                source_type,
+                internal_status,
+                search,
+            )
+        )
         .order_by(ReconciliationResult.id.asc())
     )
 
@@ -116,6 +254,7 @@ def count_fund_request_results(
     session: Session,
     job_id: uuid.UUID,
     internal_status: str,
+    search: ResultSearchFilters | None = None,
 ) -> int:
     """Count one job's Fund Request results for an exact internal status."""
 
@@ -124,6 +263,7 @@ def count_fund_request_results(
         job_id,
         FUND_REQUEST_SOURCE_TYPE,
         internal_status,
+        search,
     )
 
 
@@ -132,6 +272,7 @@ def list_fund_request_results(
     job_id: uuid.UUID,
     internal_status: str,
     *,
+    search: ResultSearchFilters | None = None,
     offset: int = 0,
     limit: int | None = None,
 ) -> list[ReconciliationResult]:
@@ -147,6 +288,7 @@ def list_fund_request_results(
         job_id,
         FUND_REQUEST_SOURCE_TYPE,
         internal_status,
+        search=search,
         offset=offset,
         limit=limit,
     )
@@ -156,6 +298,7 @@ def count_va_transaction_results(
     session: Session,
     job_id: uuid.UUID,
     internal_status: str,
+    search: ResultSearchFilters | None = None,
 ) -> int:
     """Count one job's VA Transaction results for an exact internal status."""
 
@@ -164,6 +307,7 @@ def count_va_transaction_results(
         job_id,
         VA_TRANSACTION_SOURCE_TYPE,
         internal_status,
+        search,
     )
 
 
@@ -172,6 +316,7 @@ def list_va_transaction_results(
     job_id: uuid.UUID,
     internal_status: str,
     *,
+    search: ResultSearchFilters | None = None,
     offset: int = 0,
     limit: int | None = None,
 ) -> list[ReconciliationResult]:
@@ -187,18 +332,39 @@ def list_va_transaction_results(
         job_id,
         VA_TRANSACTION_SOURCE_TYPE,
         internal_status,
+        search=search,
         offset=offset,
         limit=limit,
     )
 
 
-def _matched_bank_row_ranking(job_id: uuid.UUID):
+def _matched_bank_row_ranking(
+    job_id: uuid.UUID,
+    search: ResultSearchFilters | None = None,
+):
     """Rank matched bank rows so each statement row is returned once.
 
     A bank row is identified by its source filename and statement row number.
     The engine allocates each bank row to at most one source result, but this
-    ranking keeps the read API resilient to duplicate persisted rows.
+    ranking keeps the read API resilient to duplicate persisted rows.  Search
+    filters are applied before ranking so counting and listing stay identical.
     """
+
+    conditions = [
+        ReconciliationResult.job_id == job_id,
+        ReconciliationResult.final_status == "MATCHED",
+        ReconciliationResult.bank_row_number.is_not(None),
+    ]
+    conditions.extend(
+        _search_conditions(
+            search,
+            reference_columns=MATCHED_BANK_REFERENCE_COLUMNS,
+            amount_column=ReconciliationResult.bank_amount,
+            name_columns=MATCHED_BANK_NAME_COLUMNS,
+            bank_columns=MATCHED_BANK_COLUMNS,
+            bank_row_number_column=ReconciliationResult.bank_row_number,
+        )
+    )
 
     return (
         select(
@@ -213,11 +379,7 @@ def _matched_bank_row_ranking(job_id: uuid.UUID):
             )
             .label("bank_row_rank"),
         )
-        .where(
-            ReconciliationResult.job_id == job_id,
-            ReconciliationResult.final_status == "MATCHED",
-            ReconciliationResult.bank_row_number.is_not(None),
-        )
+        .where(*conditions)
         .subquery()
     )
 
@@ -225,10 +387,11 @@ def _matched_bank_row_ranking(job_id: uuid.UUID):
 def count_matched_bank_transactions(
     session: Session,
     job_id: uuid.UUID,
+    search: ResultSearchFilters | None = None,
 ) -> int:
     """Count distinct matched bank statement rows for one job."""
 
-    ranked = _matched_bank_row_ranking(job_id)
+    ranked = _matched_bank_row_ranking(job_id, search)
     statement = (
         select(func.count()).select_from(ranked).where(ranked.c.bank_row_rank == 1)
     )
@@ -240,6 +403,7 @@ def list_matched_bank_transactions(
     session: Session,
     job_id: uuid.UUID,
     *,
+    search: ResultSearchFilters | None = None,
     offset: int = 0,
     limit: int | None = None,
 ) -> list[ReconciliationResult]:
@@ -251,7 +415,7 @@ def list_matched_bank_transactions(
     transaction so callers can see which source record the bank row matched.
     """
 
-    ranked = _matched_bank_row_ranking(job_id)
+    ranked = _matched_bank_row_ranking(job_id, search)
     statement = (
         select(ReconciliationResult)
         .join(ranked, ReconciliationResult.id == ranked.c.result_id)
@@ -268,19 +432,40 @@ def list_matched_bank_transactions(
     return list(session.scalars(statement))
 
 
+def _unmatched_bank_filters(
+    job_id: uuid.UUID,
+    search: ResultSearchFilters | None = None,
+) -> list:
+    filters = [
+        UnmatchedBankTransaction.job_id == job_id,
+        UnmatchedBankTransaction.active_settlement_id.is_(None),
+    ]
+    filters.extend(
+        _search_conditions(
+            search,
+            reference_columns=UNMATCHED_BANK_REFERENCE_COLUMNS,
+            amount_column=UnmatchedBankTransaction.amount,
+            name_columns=UNMATCHED_BANK_NAME_COLUMNS,
+            bank_columns=UNMATCHED_BANK_COLUMNS,
+            bank_row_number_column=(
+                UnmatchedBankTransaction.statement_row_number
+            ),
+        )
+    )
+    return filters
+
+
 def count_unmatched_bank_transactions(
     session: Session,
     job_id: uuid.UUID,
+    search: ResultSearchFilters | None = None,
 ) -> int:
     """Count one job's genuinely unmatched bank statement rows."""
 
     statement = (
         select(func.count())
         .select_from(UnmatchedBankTransaction)
-        .where(
-            UnmatchedBankTransaction.job_id == job_id,
-            UnmatchedBankTransaction.active_settlement_id.is_(None),
-        )
+        .where(*_unmatched_bank_filters(job_id, search))
     )
 
     return int(session.scalar(statement) or 0)
@@ -290,6 +475,7 @@ def list_unmatched_bank_transactions(
     session: Session,
     job_id: uuid.UUID,
     *,
+    search: ResultSearchFilters | None = None,
     offset: int = 0,
     limit: int | None = None,
 ) -> list[UnmatchedBankTransaction]:
@@ -303,10 +489,7 @@ def list_unmatched_bank_transactions(
 
     statement = (
         select(UnmatchedBankTransaction)
-        .where(
-            UnmatchedBankTransaction.job_id == job_id,
-            UnmatchedBankTransaction.active_settlement_id.is_(None),
-        )
+        .where(*_unmatched_bank_filters(job_id, search))
         .order_by(UnmatchedBankTransaction.id.asc())
     )
 
