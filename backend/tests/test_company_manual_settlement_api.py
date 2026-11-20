@@ -388,24 +388,25 @@ def test_company_name_is_unique_case_insensitively(client):
     assert "already exists" in duplicate.json()["detail"].lower()
 
 
-def test_company_list_supports_search_and_pagination(client):
+def test_company_list_supports_search_and_fixed_pagination(client):
     client.post("/api/companies", json={"name": "Zeta Ltd", "alias": "ZED"})
     client.post("/api/companies", json={"name": "Alpha Ltd", "alias": "ALP"})
     client.post("/api/companies", json={"name": "Beta Corp"})
 
-    response = client.get("/api/companies", params={"limit": 2})
+    response = client.get("/api/companies")
 
     assert response.status_code == 200, response.text
     payload = response.json()
     assert payload["total"] == 3
     assert payload["page"] == 1
-    assert payload["limit"] == 2
-    assert payload["total_pages"] == 2
-    assert payload["has_next"] is True
+    assert payload["limit"] == 100
+    assert payload["total_pages"] == 1
+    assert payload["has_next"] is False
     assert payload["has_previous"] is False
     assert [item["name"] for item in payload["items"]] == [
         "Alpha Ltd",
         "Beta Corp",
+        "Zeta Ltd",
     ]
 
     search = client.get("/api/companies", params={"search": "zed"})

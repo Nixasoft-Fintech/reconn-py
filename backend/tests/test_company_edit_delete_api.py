@@ -508,3 +508,152 @@ def test_delete_then_create_same_name_is_allowed(client, session_factory):
     )
     assert recreated.status_code == 201, recreated.text
     assert recreated.json()["company_id"] != str(COMPANY_ID)
+
+
+# ---------------------------------------------------------------------------
+# Listing with a fixed page size
+# ---------------------------------------------------------------------------
+
+
+def _seed_paginated_companies(session):
+    names = [f"Acme {i:03d}" for i in range(103)] + [
+        f"Beta {i:03d}" for i in range(103, 105)
+    ]
+    session.add_all(
+        Company(
+            id=uuid.uuid4(),
+            name=name,
+            name_key=name.casefold(),
+            alias="ZZTOKEN" if name == "Beta 104" else None,
+        )
+        for name in names
+    )
+    session.commit()
+    return names
+
+
+def test_list_companies_page_one_returns_at_most_100(client, session_factory):
+    with session_factory() as session:
+        _seed_paginated_companies(session)
+
+    response = client.get("/api/companies", params={"page": 1})
+
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    assert payload["total"] == 105
+    assert payload["limit"] == 100
+    assert len(payload["items"]) == 100
+    assert payload["items"][0]["name"] == "Acme 000"
+    assert payload["items"][-1]["name"] == "Acme 099"
+
+
+def test_list_companies_page_two_returns_next_page(client, session_factory):
+    with session_factory() as session:
+        _seed_paginated_companies(session)
+
+    response = client.get("/api/companies", params={"page": 2})
+
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    assert payload["page"] == 2
+    assert len(payload["items"]) == 5
+    assert [item["name"] for item in payload["items"]] == [
+        "Acme 100",
+        "Acme 101",
+        "Acme 102",
+        "Beta 103",
+        "Beta 104",
+    ]
+
+
+def test_list_companies_search_works_with_pagination(client, session_factory):
+    with session_factory() as session:
+        _seed_paginated_companies(session)
+
+    first = client.get(
+        "/api/companies",
+        params={"search": "acme", "page": 1},
+    )
+    assert first.status_code == 200, first.text
+    assert first.json()["total"] == 103
+    assert len(first.json()["items"]) == 100
+
+    second = client.get(
+        "/api/companies",
+        params={"search": "acme", "page": 2},
+    )
+    assert [item["name"] for item in second.json()["items"]] == [
+        "Acme 100",
+        "Acme 101",
+        "Acme 102",
+    ]
+
+    beta = client.get("/api/companies", params={"search": "beta"})
+    assert beta.json()["total"] == 2
+    assert [item["name"] for item in beta.json()["items"]] == [
+        "Beta 103",
+        "Beta 104",
+    ]
+
+    by_alias = client.get("/api/companies", params={"search": "zztoken"})
+    assert [item["name"] for item in by_alias.json()["items"]] == ["Beta 104"]
+
+
+def test_list_companies_does_not_accept_client_limit(client, session_factory):
+    with session_factory() as session:
+        _seed_paginated_companies(session)
+
+    for supplied in ("5", "500", "not-a-number"):
+        response = client.get(
+            "/api/companies",
+            params={"limit": supplied},
+        )
+        assert response.status_code == 200, response.text
+        payload = response.json()
+        assert payload["limit"] == 100
+        assert len(payload["items"]) == 100
+
+
+def test_openapi_hides_limit_for_company_list():
+    parameters = app.openapi()["paths"]["/api/companies"]["get"][
+        "parameters"
+    ]
+    names = {parameter["name"] for parameter in parameters}
+
+    assert "limit" not in names
+    assert {"page", "search"} <= names
+
+
+def test_list_companies_pagination_metadata(client, session_factory):
+    with session_factory() as session:
+        _seed_paginated_companies(session)
+
+    first = client.get("/api/companies", params={"page": 1}).json()
+    assert {
+        "total": first["total"],
+        "page": first["page"],
+        "limit": first["limit"],
+        "total_pages": first["total_pages"],
+        "has_next": first["has_next"],
+        "has_previous": first["has_previous"],
+    } == {
+        "total": 105,
+        "page": 1,
+        "limit": 100,
+        "total_pages": 2,
+        "has_next": True,
+        "has_previous": False,
+    }
+
+    second = client.get("/api/companies", params={"page": 2}).json()
+    assert second["total"] == 105
+    assert second["page"] == 2
+    assert second["limit"] == 100
+    assert second["total_pages"] == 2
+    assert second["has_next"] is False
+    assert second["has_previous"] is True
+
+    empty = client.get("/api/companies", params={"page": 3}).json()
+    assert empty["items"] == []
+    assert empty["has_next"] is False
+    assert empty["has_previous"] is True

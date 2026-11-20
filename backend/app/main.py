@@ -822,25 +822,26 @@ def create_company_endpoint(
 def list_companies_endpoint(
     search: str | None = Query(None, max_length=255),
     page: PageParam = DEFAULT_PAGE,
-    limit: LimitParam = DEFAULT_LIMIT,
     session: Session = Depends(get_db_session),
     current_user: User = Depends(get_current_user),
 ) -> dict[str, Any]:
     """Return companies sorted alphabetically by name. Admin only."""
 
+    # Page size is fixed: ``limit`` is no longer accepted from clients.
+    page_size = DEFAULT_LIMIT
     total, items = list_companies(
         session,
         page=page,
-        limit=limit,
+        limit=page_size,
         search=search,
     )
 
-    total_pages = (total + limit - 1) // limit
+    total_pages = (total + page_size - 1) // page_size
 
     return {
         "total": total,
         "page": page,
-        "limit": limit,
+        "limit": page_size,
         "total_pages": total_pages,
         "has_next": page < total_pages,
         "has_previous": page > 1,
