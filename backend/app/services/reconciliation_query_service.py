@@ -72,10 +72,7 @@ def _contains_any(columns: tuple, value: str | None):
 
     lowered = needle.lower()
     return or_(
-        *(
-            func.lower(column).contains(lowered, autoescape=True)
-            for column in columns
-        )
+        *(func.lower(column).contains(lowered, autoescape=True) for column in columns)
     )
 
 
@@ -169,19 +166,13 @@ def _search_conditions(
     if bank is not None:
         conditions.append(bank)
 
-    if (
-        search.bank_row_number is not None
-        and bank_row_number_column is not None
-    ):
+    if search.bank_row_number is not None and bank_row_number_column is not None:
         conditions.append(bank_row_number_column == search.bank_row_number)
 
     universal = _universal_search_condition(
         search.search,
         text_columns=(
-            reference_columns
-            + name_columns
-            + bank_columns
-            + universal_extra_columns
+            reference_columns + name_columns + bank_columns + universal_extra_columns
         ),
         amount_column=amount_column,
         bank_row_number_column=bank_row_number_column,
@@ -529,9 +520,7 @@ def _unmatched_bank_filters(
             amount_column=UnmatchedBankTransaction.amount,
             name_columns=UNMATCHED_BANK_NAME_COLUMNS,
             bank_columns=UNMATCHED_BANK_COLUMNS,
-            bank_row_number_column=(
-                UnmatchedBankTransaction.statement_row_number
-            ),
+            bank_row_number_column=(UnmatchedBankTransaction.statement_row_number),
         )
     )
     return filters
@@ -603,8 +592,8 @@ def _normalize_history_status_filter(status: str | None) -> str | None:
 def _aggregate_source_status_counts(
     session: Session,
     job_ids: list[uuid.UUID],
-) -> dict[uuid.UUID, dict[str, dict[str, int]]]:
-    """Group Fund Request and VA result counts by job, source and status."""
+) -> dict[uuid.UUID, dict[str, dict[str, dict[str, Any]]]]:
+    """Group source counts and amounts by job, source and status."""
 
     if not job_ids:
         return {}
@@ -615,6 +604,9 @@ def _aggregate_source_status_counts(
             ReconciliationResult.source_type,
             ReconciliationResult.final_status,
             func.count().label("record_count"),
+            func.coalesce(func.sum(ReconciliationResult.source_amount), 0).label(
+                "total_amount"
+            ),
         )
         .where(
             ReconciliationResult.job_id.in_(job_ids),
@@ -627,12 +619,22 @@ def _aggregate_source_status_counts(
         )
     )
 
-    counts: dict[uuid.UUID, dict[str, dict[str, int]]] = {}
+    counts: dict[uuid.UUID, dict[str, dict[str, dict[str, Any]]]] = {}
 
-    for job_id, source_type, final_status, record_count in session.execute(statement):
+    for (
+        job_id,
+        source_type,
+        final_status,
+        record_count,
+        total_amount,
+    ) in session.execute(statement):
         source_counts = counts.setdefault(job_id, {})
         status_counts = source_counts.setdefault(source_type, {})
-        status_counts[final_status] = int(record_count)
+
+        status_counts[final_status] = {
+            "count": int(record_count),
+            "amount": total_amount,
+        }
 
     return counts
 
@@ -640,14 +642,8 @@ def _aggregate_source_status_counts(
 def _aggregate_bank_status_counts(
     session: Session,
     job_ids: list[uuid.UUID],
-) -> dict[uuid.UUID, dict[str, int]]:
-    """Count each persisted bank statement row once per job and status.
-
-    A bank row is identified by its source filename and statement row number,
-    matching the deduplication used by the existing bank result APIs.  When the
-    same identity is persisted more than once, a confirmed ``MATCHED`` row is
-    preferred over any other status so a bank row is never counted twice.
-    """
+) -> dict[uuid.UUID, dict[str, dict[str, Any]]]:
+    """Count and sum each persisted bank statement row once per job."""
 
     if not job_ids:
         return {}
@@ -656,6 +652,7 @@ def _aggregate_bank_status_counts(
         select(
             ReconciliationResult.job_id.label("job_id"),
             ReconciliationResult.final_status.label("final_status"),
+            ReconciliationResult.bank_amount.label("bank_amount"),
             func.row_number()
             .over(
                 partition_by=(
@@ -685,16 +682,24 @@ def _aggregate_bank_status_counts(
             ranked.c.job_id,
             ranked.c.final_status,
             func.count().label("record_count"),
+            func.coalesce(func.sum(ranked.c.bank_amount), 0).label("total_amount"),
         )
         .where(ranked.c.bank_row_rank == 1)
-        .group_by(ranked.c.job_id, ranked.c.final_status)
+        .group_by(
+            ranked.c.job_id,
+            ranked.c.final_status,
+        )
     )
 
-    counts: dict[uuid.UUID, dict[str, int]] = {}
+    counts: dict[uuid.UUID, dict[str, dict[str, Any]]] = {}
 
-    for job_id, final_status, record_count in session.execute(statement):
+    for job_id, final_status, record_count, total_amount in session.execute(statement):
         status_counts = counts.setdefault(job_id, {})
-        status_counts[final_status] = int(record_count)
+
+        status_counts[final_status] = {
+            "count": int(record_count),
+            "amount": total_amount,
+        }
 
     return counts
 
@@ -702,8 +707,8 @@ def _aggregate_bank_status_counts(
 def _aggregate_unmatched_bank_counts(
     session: Session,
     job_ids: list[uuid.UUID],
-) -> dict[uuid.UUID, int]:
-    """Group genuinely unmatched bank row counts by job."""
+) -> dict[uuid.UUID, dict[str, Any]]:
+    """Group unmatched bank counts and amounts by job."""
 
     if not job_ids:
         return {}
@@ -712,50 +717,91 @@ def _aggregate_unmatched_bank_counts(
         select(
             UnmatchedBankTransaction.job_id,
             func.count().label("record_count"),
+            func.coalesce(func.sum(UnmatchedBankTransaction.amount), 0).label(
+                "total_amount"
+            ),
         )
-        .where(UnmatchedBankTransaction.job_id.in_(job_ids))
-        .where(UnmatchedBankTransaction.active_settlement_id.is_(None))
+        .where(
+            UnmatchedBankTransaction.job_id.in_(job_ids),
+            UnmatchedBankTransaction.active_settlement_id.is_(None),
+        )
         .group_by(UnmatchedBankTransaction.job_id)
     )
 
     return {
-        job_id: int(record_count) for job_id, record_count in session.execute(statement)
+        job_id: {
+            "count": int(record_count),
+            "amount": total_amount,
+        }
+        for job_id, record_count, total_amount in session.execute(statement)
     }
 
 
 def _history_source_counts(
-    status_counts: dict[str, int],
-) -> dict[str, int]:
-    """Serialize one source category without merging other statuses."""
+    status_counts: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    """Serialize source counts and amounts without merging statuses."""
 
-    total = sum(int(value) for value in status_counts.values())
-    matched = int(status_counts.get("MATCHED", 0))
-    not_found = int(status_counts.get("NOT_FOUND", 0))
+    total = sum(int(value["count"]) for value in status_counts.values())
+
+    total_amount = sum(
+        (value["amount"] for value in status_counts.values()),
+        Decimal("0"),
+    )
+
+    matched = status_counts.get("MATCHED", {})
+    not_found = status_counts.get("NOT_FOUND", {})
+
+    matched_count = int(matched.get("count", 0))
+    not_found_count = int(not_found.get("count", 0))
+
+    matched_amount = matched.get("amount", Decimal("0"))
+    not_found_amount = not_found.get("amount", Decimal("0"))
 
     return {
         "total_records": total,
-        "matched_records": matched,
-        "not_found_records": not_found,
-        "other_records": total - matched - not_found,
+        "total_amount": total_amount,
+        "matched_records": matched_count,
+        "matched_amount": matched_amount,
+        "not_found_records": not_found_count,
+        "not_found_amount": not_found_amount,
+        "other_records": total - matched_count - not_found_count,
+        "other_amount": total_amount - matched_amount - not_found_amount,
     }
 
 
 def _history_bank_counts(
-    status_counts: dict[str, int],
-    unmatched_count: int,
-) -> dict[str, int]:
-    """Serialize bank counts using the existing bank result semantics."""
+    status_counts: dict[str, dict[str, Any]],
+    unmatched_count: dict[str, Any],
+) -> dict[str, Any]:
+    """Serialize bank counts and amounts using existing semantics."""
 
     counts = dict(status_counts)
-    matched = int(counts.pop("MATCHED", 0))
-    other = sum(int(value) for value in counts.values())
-    not_found = int(unmatched_count)
+
+    matched = counts.pop("MATCHED", {})
+
+    matched_count = int(matched.get("count", 0))
+    matched_amount = matched.get("amount", Decimal("0"))
+
+    other_count = sum(int(value["count"]) for value in counts.values())
+
+    other_amount = sum(
+        (value["amount"] for value in counts.values()),
+        Decimal("0"),
+    )
+
+    not_found_count = int(unmatched_count.get("count", 0))
+    not_found_amount = unmatched_count.get("amount", Decimal("0"))
 
     return {
-        "total_records": matched + other + not_found,
-        "matched_records": matched,
-        "not_found_records": not_found,
-        "other_records": other,
+        "total_records": matched_count + other_count + not_found_count,
+        "total_amount": matched_amount + other_amount + not_found_amount,
+        "matched_records": matched_count,
+        "matched_amount": matched_amount,
+        "not_found_records": not_found_count,
+        "not_found_amount": not_found_amount,
+        "other_records": other_count,
+        "other_amount": other_amount,
     }
 
 
@@ -786,9 +832,9 @@ def _history_processing_duration(
 
 def _serialize_history_job(
     job: ReconciliationJob,
-    source_counts: dict[str, dict[str, int]],
-    bank_status_counts: dict[str, int],
-    unmatched_bank_count: int,
+    source_counts: dict[str, dict[str, dict[str, Any]]],
+    bank_status_counts: dict[str, dict[str, Any]],
+    unmatched_bank_count: dict[str, Any],
 ) -> dict[str, Any]:
     """Serialize a persisted job without running reconciliation."""
 
@@ -824,6 +870,7 @@ def _serialize_history_jobs(
         return []
 
     job_ids = [job.job_id for job in jobs]
+
     source_counts = _aggregate_source_status_counts(session, job_ids)
     bank_counts = _aggregate_bank_status_counts(session, job_ids)
     unmatched_counts = _aggregate_unmatched_bank_counts(session, job_ids)
@@ -833,7 +880,10 @@ def _serialize_history_jobs(
             job,
             source_counts.get(job.job_id, {}),
             bank_counts.get(job.job_id, {}),
-            unmatched_counts.get(job.job_id, 0),
+            unmatched_counts.get(
+                job.job_id,
+                {"count": 0, "amount": Decimal("0")},
+            ),
         )
         for job in jobs
     ]
