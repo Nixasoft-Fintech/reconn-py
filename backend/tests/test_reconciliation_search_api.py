@@ -199,6 +199,35 @@ def seeded_session(session_factory):
             source_bank="HDFC",
         )
 
+        # Rejected Fund Requests are persisted by the engine with the internal
+        # final status EXCLUDED_BY_STATUS and a non-approved source status.
+        _add_result(
+            session,
+            source_type="fund_request",
+            final_status="EXCLUDED_BY_STATUS",
+            source_status="rejected",
+            exception_reason="Fund Request status is not approved.",
+            source_transaction_id="FR-REJ-1",
+            source_utr="UTRFRREJ1",
+            source_reference="REF-FR-REJ1",
+            source_amount=Decimal("700.0000"),
+            source_user="REJECTED CO",
+            source_bank="ICICI",
+        )
+        _add_result(
+            session,
+            source_type="fund_request",
+            final_status="EXCLUDED_BY_STATUS",
+            source_status="rejected",
+            exception_reason="Fund Request status is not approved.",
+            source_transaction_id="FR-REJ-2",
+            source_utr="UTRFRREJ2",
+            source_reference="REF-FR-REJ2",
+            source_amount=Decimal("800.0000"),
+            source_user="REJECTED CO",
+            source_bank="HDFC",
+        )
+
         _add_unmatched_bank(
             session,
             row_number=21,
@@ -263,6 +292,8 @@ def _add_result(
     source_user,
     source_bank,
     source_virtual_account_number=None,
+    source_status="approved",
+    exception_reason=None,
     bank_row_number=None,
     bank_name=None,
     bank_utr=None,
@@ -283,7 +314,8 @@ def _add_result(
             source_amount=source_amount,
             source_user=source_user,
             source_date=datetime(2026, 11, 10, 10, 0, tzinfo=timezone.utc),
-            source_status="approved",
+            source_status=source_status,
+            exception_reason=exception_reason,
             source_bank=source_bank,
             source_payment_mode="NEFT",
             source_virtual_account_number=source_virtual_account_number,
@@ -1097,3 +1129,230 @@ def test_optional_search_does_not_change_no_filter_behavior(
 
     assert without_search.json() == with_blank_search.json()
     assert without_search.json()["total"] == EXPECTED_TOTALS[api]
+
+
+# ---------------------------------------------------------------------------
+# REJECTED status on the Fund Request results API only
+# ---------------------------------------------------------------------------
+
+REJECTED_IDS = {"FR-REJ-1", "FR-REJ-2"}
+
+REJECTED_SEARCH_CASES = [
+    ("UTRFRREJ1", 1),
+    ("REF-FR-REJ2", 1),
+    ("FR-REJ-1", 1),
+    ("rejected co", 2),
+    ("ICICI", 1),
+    ("800", 1),
+    ("rej", 2),
+]
+
+REJECTED_FILTER_CASES = [
+    ({"reference": "UTRFRREJ1"}, 1),
+    ({"amount": "700"}, 1),
+    ({"name": "rejected"}, 2),
+    ({"bank": "ICICI"}, 1),
+    # Rejected Fund Requests have no bank row attached.
+    ({"bank_row_number": 21}, 0),
+]
+
+
+def _get_fund(client, status, **filters):
+    return client.get(
+        f"/api/reconciliation/{JOB}/fund-requests",
+        params={"status": status, **filters},
+    )
+
+
+def test_rejected_status_returns_only_rejected_fund_requests(
+    client,
+    seeded_session,
+):
+    response = _get_fund(client, "REJECTED")
+
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    assert payload["status"] == "REJECTED"
+    assert payload["total"] == 2
+    assert len(payload["items"]) == 2
+    assert {
+        item["source_transaction_id"] for item in payload["items"]
+    } == REJECTED_IDS
+
+
+def test_rejected_records_absent_from_matched_and_not_found(
+    client,
+    seeded_session,
+):
+    for status in ("MATCHED", "NOT_FOUND"):
+        payload = _get_fund(client, status).json()
+        ids = {item["source_transaction_id"] for item in payload["items"]}
+        assert not (ids & REJECTED_IDS)
+
+    assert (
+        _get_fund(client, "MATCHED").json()["total"]
+        == EXPECTED_TOTALS["fund_matched"]
+    )
+    assert (
+        _get_fund(client, "NOT_FOUND").json()["total"]
+        == EXPECTED_TOTALS["fund_unmatched"]
+    )
+
+
+def test_rejected_status_is_scoped_to_fund_request_results_api(
+    client,
+    seeded_session,
+):
+    for path in ("va-transactions", "bank-transactions"):
+        response = client.get(
+            f"/api/reconciliation/{JOB}/{path}",
+            params={"status": "REJECTED"},
+        )
+        assert response.status_code == 422
+
+    # The existing Fund Request export endpoint keeps its original statuses.
+    export = client.get(
+        f"/api/reconciliation/{JOB}/fund-requests/export",
+        params={"status": "REJECTED"},
+    )
+    assert export.status_code == 422
+
+
+@pytest.mark.parametrize(("term", "expected"), REJECTED_SEARCH_CASES)
+def test_universal_search_with_rejected_status(
+    client,
+    seeded_session,
+    term,
+    expected,
+):
+    response = _get_fund(client, "REJECTED", search=term)
+
+    assert response.status_code == 200, response.text
+    assert response.json()["total"] == expected
+
+
+@pytest.mark.parametrize(("extra", "expected"), REJECTED_FILTER_CASES)
+def test_individual_filters_with_rejected_status(
+    client,
+    seeded_session,
+    extra,
+    expected,
+):
+    response = _get_fund(client, "REJECTED", **extra)
+
+    assert response.status_code == 200, response.text
+    assert response.json()["total"] == expected
+
+
+@pytest.mark.parametrize(
+    ("search", "extra", "expected"),
+    [
+        ("REJECTED", {"bank": "ICICI"}, 1),
+        ("REJECTED", {"bank": "KOTAK"}, 0),
+        ("REJECTED", {"amount": "800"}, 1),
+        ("ICICI", {"name": "rejected"}, 1),
+    ],
+)
+def test_rejected_search_and_filters_use_and(
+    client,
+    seeded_session,
+    search,
+    extra,
+    expected,
+):
+    response = _get_fund(client, "REJECTED", search=search, **extra)
+
+    assert response.status_code == 200, response.text
+    assert response.json()["total"] == expected
+
+
+def test_rejected_pagination_and_totals(client, seeded_session):
+    first = _get_fund(client, "REJECTED", page=1, limit=1)
+    second = _get_fund(client, "REJECTED", page=2, limit=1)
+
+    assert first.status_code == 200, first.text
+    assert second.status_code == 200, second.text
+
+    first_payload = first.json()
+    second_payload = second.json()
+
+    assert first_payload["total"] == 2
+    assert first_payload["total_pages"] == 2
+    assert first_payload["page"] == 1
+    assert first_payload["limit"] == 1
+    assert first_payload["has_next"] is True
+    assert first_payload["has_previous"] is False
+    assert len(first_payload["items"]) == 1
+
+    assert second_payload["total"] == 2
+    assert second_payload["page"] == 2
+    assert second_payload["has_next"] is False
+    assert second_payload["has_previous"] is True
+    assert len(second_payload["items"]) == 1
+
+    assert first_payload["items"][0] != second_payload["items"][0]
+
+
+def test_rejected_pagination_with_active_filters(client, seeded_session):
+    first = _get_fund(client, "REJECTED", search="REJECTED", page=1, limit=1)
+    second = _get_fund(client, "REJECTED", search="REJECTED", page=2, limit=1)
+
+    assert first.json()["total"] == 2
+    assert first.json()["total_pages"] == 2
+    assert len(first.json()["items"]) == 1
+    assert second.json()["total"] == 2
+    assert len(second.json()["items"]) == 1
+    assert first.json()["items"] != second.json()["items"]
+
+
+def test_rejected_response_structure_unchanged(client, seeded_session):
+    response = _get_fund(client, "REJECTED")
+
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    assert set(payload) == {
+        "job_id",
+        "status",
+        "total",
+        "page",
+        "limit",
+        "total_pages",
+        "has_next",
+        "has_previous",
+        "items",
+    }
+    assert payload["job_id"] == str(JOB)
+    assert payload["page"] == 1
+    assert payload["limit"] == 100
+    for item in payload["items"]:
+        assert "source_transaction_id" in item
+        assert "source_status" in item
+        assert "bank_name" in item
+        assert "bank_row_number" in item
+
+
+def test_rejected_empty_result(client, seeded_session):
+    response = _get_fund(client, "REJECTED", search="DOES-NOT-EXIST")
+
+    assert response.status_code == 200, response.text
+    assert response.json()["total"] == 0
+    assert response.json()["items"] == []
+    assert response.json()["total_pages"] == 0
+    assert response.json()["has_next"] is False
+
+
+@pytest.mark.parametrize(
+    "status",
+    ["AUTO_MATCHED", "MATCHED_AFTER_REVIEW", "matched", "UNKNOWN", ""],
+)
+def test_invalid_status_values_are_still_rejected(
+    client,
+    seeded_session,
+    status,
+):
+    assert _get_fund(client, status).status_code == 422
+
+
+def test_missing_status_is_still_rejected(client, seeded_session):
+    response = client.get(f"/api/reconciliation/{JOB}/fund-requests")
+    assert response.status_code == 422

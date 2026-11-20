@@ -38,6 +38,10 @@ EXPORT_BATCH_SIZE = 500
 FRONTEND_STATUS_MAP: dict[str, str] = {
     "MATCHED": "MATCHED",
     "NOT_FOUND": "NOT_FOUND",
+    # Rejected Fund Requests are persisted by the engine as EXCLUDED_BY_STATUS
+    # (source status is not "approved").  Only the Fund Request result API
+    # exposes this frontend status; VA and Bank routes keep their own literals.
+    "REJECTED": "EXCLUDED_BY_STATUS",
 }
 
 

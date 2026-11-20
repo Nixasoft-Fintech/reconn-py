@@ -1002,12 +1002,15 @@ def reverse_manual_settlement_endpoint(
 
 
 FundRequestStatus = Literal["MATCHED", "NOT_FOUND"]
+# The results API also exposes rejected (non-approved) Fund Requests.  The
+# export endpoint keeps the original two-value literal and is left unchanged.
+FundRequestResultStatus = Literal["MATCHED", "NOT_FOUND", "REJECTED"]
 
 
 @app.get("/api/reconciliation/{job_id}/fund-requests")
 def get_fund_request_results(
     job_id: uuid.UUID,
-    status: FundRequestStatus = Query(...),
+    status: FundRequestResultStatus = Query(...),
     search: TextFilterParam = None,
     reference: TextFilterParam = None,
     amount: AmountFilterParam = None,
