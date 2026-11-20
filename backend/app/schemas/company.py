@@ -20,3 +20,27 @@ class CompanyCreate(BaseModel):
     @classmethod
     def _blank_alias_is_none(cls, value: str | None) -> str | None:
         return value or None
+
+
+class CompanyUpdate(BaseModel):
+    """Request body for editing an existing company record.
+
+    ``alias`` may be omitted to keep the current value or supplied explicitly
+    (including ``null``) to clear it.  ``model_fields_set`` on the parsed body
+    tells the two cases apart.
+    """
+
+    name: str = Field(min_length=1, max_length=255)
+    alias: str | None = Field(default=None, max_length=255)
+
+    @field_validator("name", "alias", mode="before")
+    @classmethod
+    def _strip(cls, value):
+        if isinstance(value, str):
+            return value.strip()
+        return value
+
+    @field_validator("alias")
+    @classmethod
+    def _blank_alias_is_none(cls, value: str | None) -> str | None:
+        return value or None

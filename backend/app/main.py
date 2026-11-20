@@ -79,7 +79,7 @@ from app.db_models.user import User
 from app.matching.engine import MatchingConfig, reconcile_transactions
 
 from app.schemas.auth import LoginRequest, LoginResponse
-from app.schemas.company import CompanyCreate
+from app.schemas.company import CompanyCreate, CompanyUpdate
 from app.schemas.manual_settlement import (
     ManualSettlementCreate,
     ManualSettlementReversal,
@@ -106,9 +106,11 @@ from app.services.bank_transaction_service import (
 )
 from app.services.company_service import (
     create_company,
+    delete_company,
     get_company,
     list_companies,
     serialize_company,
+    update_company,
 )
 from app.services.errors import ServiceError
 from app.services.manual_settlement_service import (
@@ -860,6 +862,45 @@ def get_company_endpoint(
         _raise_service_error(exc)
 
     return serialize_company(company)
+
+
+@app.put("/api/companies/{company_id}")
+def update_company_endpoint(
+    company_id: uuid.UUID,
+    payload: CompanyUpdate,
+    session: Session = Depends(get_db_session),
+    current_user: User = Depends(require_admin),
+) -> dict[str, Any]:
+    """Edit the name and/or alias of one company. Admin only."""
+
+    try:
+        company = update_company(
+            session,
+            company_id,
+            name=payload.name,
+            alias=payload.alias,
+            alias_supplied="alias" in payload.model_fields_set,
+        )
+    except ServiceError as exc:
+        _raise_service_error(exc)
+
+    return serialize_company(company)
+
+
+@app.delete("/api/companies/{company_id}")
+def delete_company_endpoint(
+    company_id: uuid.UUID,
+    session: Session = Depends(get_db_session),
+    current_user: User = Depends(require_admin),
+) -> dict[str, Any]:
+    """Delete one company that has no reconciliation references. Admin only."""
+
+    try:
+        delete_company(session, company_id)
+    except ServiceError as exc:
+        _raise_service_error(exc)
+
+    return {"company_id": str(company_id), "deleted": True}
 
 
 @app.post(
