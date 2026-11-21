@@ -5,6 +5,8 @@ import logging
 import re
 import tempfile
 import uuid
+import os
+import secrets
 
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -18,6 +20,7 @@ from fastapi import (
     FastAPI,
     File,
     Form,
+    Header,
     HTTPException,
     Path as PathParam,
     Query,
@@ -92,6 +95,9 @@ from app.services.csv_export_service import (
     build_export_filename,
     fund_request_csv,
     va_transaction_csv,
+)
+from app.services.cleanup_reconciliations import (
+    cleanup_expired_reconciliations,
 )
 from app.services.persistence_service import (
     create_pending_job,
@@ -280,6 +286,41 @@ def _suggest_column_candidates(columns: list[str]) -> dict[str, list[str]]:
 @app.get("/api/health")
 async def health() -> dict[str, str]:
     return {"status": "ok", "service": APP_TITLE}
+
+
+@app.post("/api/internal/cleanup-expired-reconciliations")
+def trigger_cleanup(
+    x_cleanup_secret: str | None = Header(default=None),
+) -> dict[str, Any]:
+
+    # Read the secret configured in Render environment variables.
+    expected_secret = os.getenv("CLEANUP_SECRET")
+
+    if not expected_secret:
+        raise HTTPException(
+            status_code=500,
+            detail="Cleanup secret is not configured.",
+        )
+
+    # Verify that the request comes from an authorized scheduler.
+    if not x_cleanup_secret or not secrets.compare_digest(
+        x_cleanup_secret,
+        expected_secret,
+    ):
+        raise HTTPException(
+            status_code=401,
+            detail="Unauthorized.",
+        )
+
+    # Delete expired reconciliation records.
+    cleanup_expired_reconciliations()
+
+    logger.info("Scheduled reconciliation cleanup triggered successfully.")
+
+    return {
+        "success": True,
+        "message": "Expired reconciliation cleanup completed.",
+    }
 
 
 @app.post("/api/reconcile")

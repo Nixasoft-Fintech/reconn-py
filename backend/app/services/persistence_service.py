@@ -26,6 +26,7 @@ import logging
 from app.services.failure_classifier import classify_failure
 import sqlalchemy as sa
 from sqlalchemy.dialects import postgresql
+from app.services.retention import calculate_expiry_date
 
 retry_outputs = {}
 _job_locks = {}
@@ -333,6 +334,9 @@ def create_pending_job(
     summary = output.summary
 
     with SessionLocal.begin() as session:
+        created_at = datetime.now(timezone.utc)
+        expires_at = calculate_expiry_date(created_at)
+
         job = ReconciliationJob(
             job_id=job_id,
             user_id=user_id,
@@ -340,6 +344,8 @@ def create_pending_job(
             fund_request_filename=fund_request_filename,
             va_transaction_filename=va_transaction_filename,
             bank_files=_json_safe(bank_files),
+            created_at=created_at,
+            expires_at=expires_at,
         )
         session.add(job)
 
@@ -482,8 +488,6 @@ def save_reconciliation(
                 text("source_row_number IS NOT NULL"),
             )
 
-  
-
         # Save only unmatched credit bank transactions.
         unmatched_batch = []
 
@@ -494,10 +498,7 @@ def save_reconciliation(
             if credit is None:
                 continue
 
-            unmatched_batch.append(
-                _build_unmatched_bank_record(job_id, bank)
-            )
-
+            unmatched_batch.append(_build_unmatched_bank_record(job_id, bank))
 
             if len(unmatched_batch) >= batch_size:
                 _save_batch_with_retry(
