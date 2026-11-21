@@ -511,7 +511,7 @@ def test_delete_then_create_same_name_is_allowed(client, session_factory):
 
 
 # ---------------------------------------------------------------------------
-# Listing with a fixed page size
+# Listing with a client-controlled page size
 # ---------------------------------------------------------------------------
 
 
@@ -532,7 +532,10 @@ def _seed_paginated_companies(session):
     return names
 
 
-def test_list_companies_page_one_returns_at_most_100(client, session_factory):
+def test_list_companies_defaults_to_100_when_limit_omitted(
+    client,
+    session_factory,
+):
     with session_factory() as session:
         _seed_paginated_companies(session)
 
@@ -599,29 +602,135 @@ def test_list_companies_search_works_with_pagination(client, session_factory):
     assert [item["name"] for item in by_alias.json()["items"]] == ["Beta 104"]
 
 
-def test_list_companies_does_not_accept_client_limit(client, session_factory):
+def test_list_companies_limit_100(client, session_factory):
     with session_factory() as session:
         _seed_paginated_companies(session)
 
-    for supplied in ("5", "500", "not-a-number"):
-        response = client.get(
-            "/api/companies",
-            params={"limit": supplied},
+    response = client.get("/api/companies", params={"limit": 100})
+
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    assert payload["limit"] == 100
+    assert len(payload["items"]) == 100
+    assert payload["total_pages"] == 2
+
+
+@pytest.mark.parametrize("limit", [500, 1000])
+def test_list_companies_large_limit_returns_all_available(
+    client,
+    session_factory,
+    limit,
+):
+    with session_factory() as session:
+        _seed_paginated_companies(session)
+
+    response = client.get("/api/companies", params={"limit": limit})
+
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    assert payload["limit"] == limit
+    assert payload["total"] == 105
+    assert len(payload["items"]) == 105
+    assert payload["total_pages"] == 1
+    assert payload["has_next"] is False
+
+
+def _seed_many_companies(session, count):
+    session.add_all(
+        Company(
+            id=uuid.uuid4(),
+            name=name,
+            name_key=name.casefold(),
+            alias=None,
         )
-        assert response.status_code == 200, response.text
-        payload = response.json()
-        assert payload["limit"] == 100
-        assert len(payload["items"]) == 100
+        for name in (f"Acme {i:04d}" for i in range(count))
+    )
+    session.commit()
 
 
-def test_openapi_hides_limit_for_company_list():
+def test_list_companies_page_two_with_large_limit(client, session_factory):
+    with session_factory() as session:
+        _seed_many_companies(session, 1005)
+
+    response = client.get(
+        "/api/companies",
+        params={"page": 2, "limit": 500},
+    )
+
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    assert payload["page"] == 2
+    assert payload["limit"] == 500
+    assert payload["total"] == 1005
+    assert payload["total_pages"] == 3
+    assert payload["has_next"] is True
+    assert payload["has_previous"] is True
+    assert len(payload["items"]) == 500
+    assert payload["items"][0]["name"] == "Acme 0500"
+    assert payload["items"][-1]["name"] == "Acme 0999"
+
+
+def test_list_companies_search_with_custom_limit(client, session_factory):
+    with session_factory() as session:
+        _seed_paginated_companies(session)
+
+    first = client.get(
+        "/api/companies",
+        params={"search": "acme", "limit": 50},
+    )
+    assert first.status_code == 200, first.text
+    payload = first.json()
+    assert payload["total"] == 103
+    assert payload["limit"] == 50
+    assert payload["total_pages"] == 3
+    assert payload["has_next"] is True
+    assert len(payload["items"]) == 50
+
+    third = client.get(
+        "/api/companies",
+        params={"search": "acme", "limit": 50, "page": 3},
+    )
+    assert [item["name"] for item in third.json()["items"]] == [
+        "Acme 100",
+        "Acme 101",
+        "Acme 102",
+    ]
+    assert third.json()["has_next"] is False
+    assert third.json()["has_previous"] is True
+
+    by_alias = client.get(
+        "/api/companies",
+        params={"search": "zztoken", "limit": 500},
+    )
+    assert by_alias.json()["limit"] == 500
+    assert [item["name"] for item in by_alias.json()["items"]] == ["Beta 104"]
+
+
+@pytest.mark.parametrize(
+    "params",
+    [{"limit": 0}, {"limit": -1}, {"page": 0}, {"page": 0, "limit": 5}],
+)
+def test_list_companies_rejects_non_positive_pagination(client, params):
+    response = client.get("/api/companies", params=params)
+
+    assert response.status_code == 422
+
+
+def test_openapi_exposes_unbounded_limit_for_company_list():
     parameters = app.openapi()["paths"]["/api/companies"]["get"][
         "parameters"
     ]
     names = {parameter["name"] for parameter in parameters}
 
-    assert "limit" not in names
-    assert {"page", "search"} <= names
+    assert {"page", "search", "limit"} <= names
+
+    limit_schema = next(
+        parameter["schema"]
+        for parameter in parameters
+        if parameter["name"] == "limit"
+    )
+    assert limit_schema.get("minimum") == 1
+    assert "maximum" not in limit_schema
 
 
 def test_list_companies_pagination_metadata(client, session_factory):
@@ -657,3 +766,37 @@ def test_list_companies_pagination_metadata(client, session_factory):
     assert empty["items"] == []
     assert empty["has_next"] is False
     assert empty["has_previous"] is True
+
+
+@pytest.mark.parametrize(
+    "limit,expected_pages,expected_count",
+    [(50, 3, 50), (100, 2, 100), (500, 1, 105), (1000, 1, 105)],
+)
+def test_list_companies_metadata_for_custom_limits(
+    client,
+    session_factory,
+    limit,
+    expected_pages,
+    expected_count,
+):
+    with session_factory() as session:
+        _seed_paginated_companies(session)
+
+    first = client.get("/api/companies", params={"limit": limit}).json()
+    assert first["total"] == 105
+    assert first["page"] == 1
+    assert first["limit"] == limit
+    assert first["total_pages"] == expected_pages
+    assert first["has_next"] is (expected_pages > 1)
+    assert first["has_previous"] is False
+    assert len(first["items"]) == expected_count
+
+    last = client.get(
+        "/api/companies",
+        params={"page": expected_pages, "limit": limit},
+    ).json()
+    assert last["page"] == expected_pages
+    assert last["limit"] == limit
+    assert last["total_pages"] == expected_pages
+    assert last["has_next"] is False
+    assert last["has_previous"] is (expected_pages > 1)
